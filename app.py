@@ -27,6 +27,8 @@ st.markdown("""
 # SIDEBAR
 # =============================================================================
 st.sidebar.markdown("## Strategy Controls")
+initial_inv = st.sidebar.number_input("Initial Investment ($)", value=0, min_value=0, step=500,
+    help="Lump sum invested on day 1, split at the same ratio as your monthly DCA.")
 monthly_inv = st.sidebar.number_input("Monthly Contribution ($)", value=500, min_value=10, step=50)
 
 st.sidebar.markdown("---")
@@ -57,7 +59,7 @@ def net_annual(lev: float, ann_return: float, sigma: float, expense: float) -> f
     return lev * ann_return - vol_drag(lev, sigma) - expense
 
 
-def dca_gbm_paths(years, monthly, ann_r, ann_s, expense, lev, n_paths, seed=42):
+def dca_gbm_paths(years, monthly, ann_r, ann_s, expense, lev, n_paths, seed=42, initial=0):
     rng = np.random.default_rng(seed)
     days = years * 252
     dt = 1 / 252
@@ -69,12 +71,13 @@ def dca_gbm_paths(years, monthly, ann_r, ann_s, expense, lev, n_paths, seed=42):
     log_rets = drift_daily + sigma_daily * Z
 
     portfolio = np.zeros((days + 1, n_paths))
+    portfolio[0] = initial  # lump sum on day 1
     for i in range(days):
-        if i > 0 and i % 21 == 0:
+        if i % 21 == 0:
             portfolio[i] += monthly
         portfolio[i + 1] = portfolio[i] * np.exp(log_rets[i])
 
-    invested = monthly * (days // 21)
+    invested = initial + monthly * (days // 21)
     return portfolio, invested
 
 
@@ -102,16 +105,25 @@ def load_historical() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def run_historical_dca(prices: pd.DataFrame, monthly: float) -> pd.DataFrame:
+def run_historical_dca(prices: pd.DataFrame, monthly: float, initial: float = 0) -> pd.DataFrame:
     results = {"Date": [], "VOO": [], "SPXL": [], "Invested": []}
     voo_shares = spxl_shares = invested = 0.0
     last_month = -1
+    initial_deployed = False
 
     for date, row in prices.iterrows():
         m = date.month
+        vp = float(row.get("VOO", 0))
+        sp = float(row.get("SPXL", 0))
+
+        # Deploy lump sum on first valid day
+        if not initial_deployed and vp > 0 and sp > 0 and initial > 0:
+            voo_shares += (initial / 2) / vp
+            spxl_shares += (initial / 2) / sp
+            invested += initial
+            initial_deployed = True
+
         if m != last_month:
-            vp = float(row.get("VOO", 0))
-            sp = float(row.get("SPXL", 0))
             if vp > 0:
                 voo_shares += monthly / vp
             if sp > 0:
@@ -224,6 +236,7 @@ def run_springboard(
     tiers=None,        # list of (drawdown, spxl_pct) — uses DEFAULT_TIERS if None
     rebal_speed=0.30,  # fraction of allocation gap closed each month
     n_paths=200, seed=42,
+    initial=0,         # lump sum on day 1
 ):
     if tiers is None:
         tiers = DEFAULT_TIERS
@@ -247,7 +260,11 @@ def run_springboard(
     Z = rng.standard_normal((days, n_paths))
 
     for p in range(n_paths):
-        voo_b = 0.0; spxl_b = 0.0; voo_base = 0.0
+        # seed with lump sum at day-0 target allocation
+        init_tgt = _tier_spxl(0.0, tiers if tiers else DEFAULT_TIERS) / 100.0
+        voo_b    = initial * (1.0 - init_tgt)
+        spxl_b   = initial * init_tgt
+        voo_base = initial
         idx = 1.0; idx_ath = 1.0
 
         for i in range(days):
@@ -301,6 +318,7 @@ def run_ath_rotation_backtest(
     monthly: float,
     tiers=None,
     rebal_speed: float = 0.30,
+    initial: float = 0,
 ) -> pd.DataFrame:
     """Real historical backtest using actual VOO/SPXL prices and tier table."""
     if tiers is None:
@@ -309,6 +327,7 @@ def run_ath_rotation_backtest(
     voo_b = 0.0; spxl_b = 0.0
     voo_ath = None; lm = -1; invested = 0.0
     voo_shares_pure = 0.0; spxl_shares_pure = 0.0
+    initial_deployed = False
 
     voo_prices  = prices["VOO"].values
     spxl_prices = prices["SPXL"].values
@@ -339,6 +358,15 @@ def run_ath_rotation_backtest(
         voo_ath = max(voo_ath, vp) if voo_ath else vp
         dd = max(0.0, (voo_ath - vp) / voo_ath)
         target_spxl = _tier_spxl(dd, tiers) / 100.0
+
+        # Deploy lump sum on first valid day
+        if not initial_deployed and initial > 0 and vp > 0 and sp > 0:
+            spxl_b   += initial * target_spxl
+            voo_b    += initial * (1.0 - target_spxl)
+            invested += initial
+            if vp > 0: voo_shares_pure  += (initial / 2) / vp
+            if sp > 0: spxl_shares_pure += (initial / 2) / sp
+            initial_deployed = True
 
         if date.month != lm:
             spxl_b   += monthly * target_spxl
@@ -402,7 +430,7 @@ def main():
                 "The **Forward Projection** and **Springboard** tabs use pure simulation and work without live data."
             )
         else:
-            hist = run_historical_dca(prices, monthly_inv)
+            hist = run_historical_dca(prices, monthly_inv, initial=initial_inv)
             if hist.empty or len(hist) == 0:
                 st.error("Historical DCA returned no rows — price data may be malformed. Try refreshing.")
             else:
@@ -494,6 +522,7 @@ def main():
                     prices, monthly_inv,
                     tiers=rot_tiers,
                     rebal_speed=0.30,
+                    initial=initial_inv,
                 )
 
                 rot_final    = float(rot["Strategy"].iloc[-1])
@@ -554,8 +583,8 @@ def main():
         st.markdown("GBM Monte Carlo with Ito drag — P10 / P50 / P90 fan chart.")
 
         with st.spinner(f"Simulating {n_sim} paths × 2 instruments..."):
-            voo_paths, voo_invested = dca_gbm_paths(proj_years, monthly_inv, ann_ret, ann_vol, voo_expense, 1, n_sim, seed=1)
-            spxl_paths, spxl_invested = dca_gbm_paths(proj_years, monthly_inv, ann_ret, ann_vol, spxl_expense, leverage, n_sim, seed=2)
+            voo_paths, voo_invested = dca_gbm_paths(proj_years, monthly_inv, ann_ret, ann_vol, voo_expense, 1, n_sim, seed=1, initial=initial_inv)
+            spxl_paths, spxl_invested = dca_gbm_paths(proj_years, monthly_inv, ann_ret, ann_vol, spxl_expense, leverage, n_sim, seed=2, initial=initial_inv)
 
         voo_p50 = np.percentile(voo_paths, 50, axis=1)
         spxl_p10 = np.percentile(spxl_paths, 10, axis=1)
@@ -656,6 +685,7 @@ def main():
                 tiers=tiers_input,
                 rebal_speed=rebal_sp,
                 n_paths=sb_paths,
+                initial=initial_inv,
             )
 
         sp50     = float(sb["spring_p50"][-1])
@@ -732,6 +762,7 @@ def main():
                         prices_cached, monthly_inv,
                         tiers=tiers_input,
                         rebal_speed=rebal_sp,
+                        initial=initial_inv,
                     )
                     rot_final    = float(rot["Strategy"].iloc[-1])
                     voo_pur_fin  = float(rot["VOO_pure"].iloc[-1])
