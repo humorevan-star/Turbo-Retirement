@@ -340,33 +340,61 @@ def kpi(col, label, val, sub=None, color="#e8eaf0"):
 
 
 # =============================================================================
-# SPRINGBOARD ENGINE — ATH Rotation + Drawdown Reload
+# SPRINGBOARD ENGINE — Tiered Drawdown Scaling ("Opportunistic Predator")
 # =============================================================================
-# Core insight: SPXL's best risk/reward is BELOW ATH (recovery upside is huge).
-#               SPXL's worst risk/reward is AT/ABOVE ATH (max vol drag, min upside).
+# Tiers are defined as (drawdown_threshold, spxl_pct_of_total_portfolio)
+# Between tiers: linear interpolation (smooth scaling)
+# Above ATH: hold at base (t0 allocation), gradually rotate toward voo_cruise
 #
-# Rules:
-#   1. Base DCA: spxl_base_pct% → SPXL, rest → VOO every month
-#   2. ATH rotation (reduce SPXL as VOO makes new highs above prior ATH):
-#      - Price at ATH              → hold at base split
-#      - Price X% above prior ATH  → shift Y% of SPXL bucket → VOO (scale linearly)
-#      - At ath_max% above ATH     → floor: spxl_floor% SPXL, rest VOO
-#   3. Drawdown reload (increase SPXL as VOO falls from ATH):
-#      - Price X% below ATH        → shift Z% of VOO bucket → SPXL (scale linearly)
-#      - At dd_max% below ATH      → 100% SPXL
-#   Monthly DCA contributions also follow the same ratio as the current allocation.
+# Default tiers (all tunable):
+#   ATH        →  10% SPXL  (safety accumulation, minimise vol drag)
+#   -10% ATH   →  21% SPXL  (scout position)
+#   -20% ATH   →  40% SPXL  (aggressive entry)
+#   -30% ATH   → 100% SPXL  (all-in, coiled spring)
+#
+# Monthly DCA follows the same ratio as current tier allocation.
+# Soft monthly rebalance: 30% of gap closed each month (avoids whipsaw).
 # =============================================================================
+
+# Default tier table — (drawdown_from_ath, spxl_allocation_pct)
+DEFAULT_TIERS = [
+    (0.00,  10),   # at ATH
+    (0.10,  21),   # -10%
+    (0.20,  40),   # -20%
+    (0.30, 100),   # -30% → all-in
+]
+
+def _tier_spxl(drawdown: float, tiers: list) -> float:
+    """
+    Interpolate SPXL allocation % from tier table.
+    drawdown: 0.0 = at ATH, 0.30 = 30% below ATH
+    Returns value 0.0–100.0 (percent).
+    """
+    # clamp to table range
+    if drawdown <= tiers[0][0]:
+        return float(tiers[0][1])
+    if drawdown >= tiers[-1][0]:
+        return float(tiers[-1][1])
+    for i in range(len(tiers) - 1):
+        dd0, pct0 = tiers[i]
+        dd1, pct1 = tiers[i + 1]
+        if dd0 <= drawdown <= dd1:
+            t = (drawdown - dd0) / (dd1 - dd0)
+            return float(pct0 + t * (pct1 - pct0))
+    return float(tiers[-1][1])
+
 
 def run_springboard(
     years, monthly,
     ann_r, ann_s,
     voo_exp, spxl_exp, lev,
-    spxl_base_pct=0.90,   # SPXL % at exactly ATH (neutral zone)
-    spxl_floor=0.10,      # minimum SPXL % when well above ATH
-    ath_max=0.15,         # how far above ATH before hitting spxl_floor
-    dd_max=0.40,          # drawdown at which we hit 100% SPXL
+    tiers=None,        # list of (drawdown, spxl_pct) — uses DEFAULT_TIERS if None
+    rebal_speed=0.30,  # fraction of allocation gap closed each month
     n_paths=200, seed=42,
 ):
+    if tiers is None:
+        tiers = DEFAULT_TIERS
+
     rng  = np.random.default_rng(seed)
     days = years * 252
     dt   = 1 / 252
@@ -376,7 +404,7 @@ def run_springboard(
     sig_voo    = ann_s * np.sqrt(dt)
     drift_spxl = (lev*ann_r - drag_spxl - spxl_exp - 0.5*(lev*ann_s)**2) * dt
     sig_spxl   = lev * ann_s * np.sqrt(dt)
-    drift_idx  = (ann_r - 0.5 * ann_s**2) * dt   # clean index for ATH tracking
+    drift_idx  = (ann_r - 0.5 * ann_s**2) * dt
     sig_idx    = ann_s * np.sqrt(dt)
 
     all_spring     = np.zeros((days+1, n_paths))
@@ -386,78 +414,129 @@ def run_springboard(
     Z = rng.standard_normal((days, n_paths))
 
     for p in range(n_paths):
-        voo_bucket  = 0.0
-        spxl_bucket = 0.0
-        voo_base    = 0.0   # pure VOO-only for comparison
-
-        idx      = 1.0   # synthetic market index
-        idx_ath  = 1.0   # all-time high of the index
+        voo_b = 0.0; spxl_b = 0.0; voo_base = 0.0
+        idx = 1.0; idx_ath = 1.0
 
         for i in range(days):
-            # ── daily returns ────────────────────────────────────────────
             r_voo  = drift_voo  + sig_voo  * Z[i, p]
             r_spxl = drift_spxl + sig_spxl * Z[i, p]
             r_idx  = drift_idx  + sig_idx  * Z[i, p]
 
-            # grow buckets
-            voo_bucket  = max(voo_bucket  * np.exp(r_voo),  0.0)
-            spxl_bucket = max(spxl_bucket * np.exp(r_spxl), 0.0)
-            voo_base    = max(voo_base    * np.exp(r_voo),  0.0)
-
-            # update index + ATH
+            voo_b    = max(voo_b    * np.exp(r_voo),  0.0)
+            spxl_b   = max(spxl_b   * np.exp(r_spxl), 0.0)
+            voo_base = max(voo_base  * np.exp(r_voo),  0.0)
             idx     *= np.exp(r_idx)
             idx_ath  = max(idx_ath, idx)
 
-            # ── compute target SPXL allocation ──────────────────────────
-            dd  = max(0.0, (idx_ath - idx) / idx_ath)   # 0 at ATH, positive below
-            ath_premium = max(0.0, (idx - idx_ath) / idx_ath)  # 0 at/below ATH, positive above
+            dd = max(0.0, (idx_ath - idx) / idx_ath)
+            target_spxl = _tier_spxl(dd, tiers) / 100.0
 
-            if dd > 0:
-                # below ATH: ramp SPXL up linearly from base → 100%
-                t = min(dd / dd_max, 1.0)
-                target_spxl = spxl_base_pct + t * (1.0 - spxl_base_pct)
-            else:
-                # at or above ATH: ramp SPXL down linearly from base → floor
-                t = min(ath_premium / ath_max, 1.0)
-                target_spxl = spxl_base_pct - t * (spxl_base_pct - spxl_floor)
-
-            target_spxl = float(np.clip(target_spxl, spxl_floor, 1.0))
-            target_voo  = 1.0 - target_spxl
-
-            # ── monthly: contribute + rebalance to target ────────────────
             if i > 0 and i % 21 == 0:
-                # DCA at current target ratio
-                spxl_bucket += monthly * target_spxl
-                voo_bucket  += monthly * target_voo
-                voo_base    += monthly
+                # DCA at tier ratio
+                spxl_b   += monthly * target_spxl
+                voo_b    += monthly * (1.0 - target_spxl)
+                voo_base += monthly
 
-                # soft rebalance: move 20% of the gap toward target each month
-                # (avoids tax/cost of hard daily rebalancing)
-                total = voo_bucket + spxl_bucket
+                # soft rebalance
+                total = voo_b + spxl_b
                 if total > 0:
-                    current_spxl_frac = spxl_bucket / total
-                    gap = target_spxl - current_spxl_frac
-                    rebal = total * gap * 0.20   # 20% of gap closed each month
-                    spxl_bucket = max(spxl_bucket + rebal, 0.0)
-                    voo_bucket  = max(voo_bucket  - rebal, 0.0)
+                    cur_spxl = spxl_b / total
+                    gap  = target_spxl - cur_spxl
+                    rb   = total * gap * rebal_speed
+                    spxl_b = max(spxl_b + rb, 0.0)
+                    voo_b  = max(voo_b  - rb, 0.0)
 
-            total = voo_bucket + spxl_bucket
-            spxl_frac = spxl_bucket / total if total > 0 else target_spxl
-
+            total = voo_b + spxl_b
             all_spring[i+1, p]     = total
             all_voo_base[i+1, p]   = voo_base
-            all_spxl_alloc[i+1, p] = spxl_frac
+            all_spxl_alloc[i+1, p] = spxl_b / total if total > 0 else target_spxl
 
     return {
-        "voo_p50":        np.percentile(all_voo_base,   50, axis=1),
-        "spring_p10":     np.percentile(all_spring,     10, axis=1),
-        "spring_p25":     np.percentile(all_spring,     25, axis=1),
-        "spring_p50":     np.percentile(all_spring,     50, axis=1),
-        "spring_p75":     np.percentile(all_spring,     75, axis=1),
-        "spring_p90":     np.percentile(all_spring,     90, axis=1),
-        "spxl_alloc_p50": np.percentile(all_spxl_alloc, 50, axis=1),
-        "shifted_pct":    float(np.mean(np.percentile(all_spxl_alloc, 50, axis=1)) * 100),
+        "voo_p50":        np.percentile(all_voo_base,    50, axis=1),
+        "spring_p10":     np.percentile(all_spring,      10, axis=1),
+        "spring_p25":     np.percentile(all_spring,      25, axis=1),
+        "spring_p50":     np.percentile(all_spring,      50, axis=1),
+        "spring_p75":     np.percentile(all_spring,      75, axis=1),
+        "spring_p90":     np.percentile(all_spring,      90, axis=1),
+        "spxl_alloc_p50": np.percentile(all_spxl_alloc,  50, axis=1),
+        "avg_spxl":       float(np.mean(np.percentile(all_spxl_alloc, 50, axis=1)) * 100),
     }
+
+
+def run_ath_rotation_backtest(
+    prices: pd.DataFrame,
+    monthly: float,
+    tiers=None,
+    rebal_speed: float = 0.30,
+) -> pd.DataFrame:
+    """Real historical backtest using actual VOO/SPXL prices and tier table."""
+    if tiers is None:
+        tiers = DEFAULT_TIERS
+
+    voo_b = 0.0; spxl_b = 0.0
+    voo_ath = None; lm = -1; invested = 0.0
+    voo_shares_pure = 0.0; spxl_shares_pure = 0.0
+
+    voo_prices  = prices["VOO"].values
+    spxl_prices = prices["SPXL"].values
+    dates       = prices.index
+
+    out_strategy = np.zeros(len(dates))
+    out_alloc    = np.zeros(len(dates))
+    out_invested = np.zeros(len(dates))
+    out_voo_pure = np.zeros(len(dates))
+    out_spxl_pure= np.zeros(len(dates))
+
+    for i, date in enumerate(dates):
+        vp = voo_prices[i]; sp = spxl_prices[i]
+        if vp <= 0 or sp <= 0:
+            out_strategy[i]  = voo_b + spxl_b
+            out_alloc[i]     = spxl_b / max(voo_b + spxl_b, 1)
+            out_invested[i]  = invested
+            out_voo_pure[i]  = voo_shares_pure * vp
+            out_spxl_pure[i] = spxl_shares_pure * sp
+            continue
+
+        # daily price-return compounding
+        if i > 0:
+            prev_vp = voo_prices[i-1]; prev_sp = spxl_prices[i-1]
+            if prev_vp > 0: voo_b  *= vp  / prev_vp
+            if prev_sp > 0: spxl_b *= sp  / prev_sp
+
+        voo_ath = max(voo_ath, vp) if voo_ath else vp
+        dd = max(0.0, (voo_ath - vp) / voo_ath)
+        target_spxl = _tier_spxl(dd, tiers) / 100.0
+
+        if date.month != lm:
+            spxl_b   += monthly * target_spxl
+            voo_b    += monthly * (1.0 - target_spxl)
+            invested += monthly
+            if vp > 0: voo_shares_pure  += monthly / vp
+            if sp > 0: spxl_shares_pure += monthly / sp
+
+            total = voo_b + spxl_b
+            if total > 0:
+                cur = spxl_b / total
+                gap = target_spxl - cur
+                rb  = total * gap * rebal_speed
+                if rb > 0 and voo_b  >= rb:  spxl_b += rb; voo_b -= rb
+                elif rb < 0 and spxl_b >= abs(rb): voo_b += abs(rb); spxl_b -= abs(rb)
+            lm = date.month
+
+        total = voo_b + spxl_b
+        out_strategy[i]  = total
+        out_alloc[i]     = spxl_b / total if total > 0 else target_spxl
+        out_invested[i]  = invested
+        out_voo_pure[i]  = voo_shares_pure * vp
+        out_spxl_pure[i] = spxl_shares_pure * sp
+
+    return pd.DataFrame({
+        "Strategy":   np.round(out_strategy, 2),
+        "SPXL_alloc": np.round(out_alloc * 100, 1),
+        "Invested":   np.round(out_invested, 2),
+        "VOO_pure":   np.round(out_voo_pure, 2),
+        "SPXL_pure":  np.round(out_spxl_pure, 2),
+    }, index=dates)
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -670,94 +749,106 @@ def main():
         st.plotly_chart(fig2, use_container_width=True)
 
     # -------------------------------------------------------------------------
-    # TAB 3: SPRINGBOARD — ATH Rotation + Drawdown Reload
+    # TAB 3: SPRINGBOARD — Tiered Drawdown Scaling
     # -------------------------------------------------------------------------
     with tab3:
         st.markdown(
-            "**ATH Rotation strategy** — SPXL has the best risk/reward *below* its ATH (recovery upside). "
-            "Reduce SPXL as VOO makes new highs (high vol drag, low upside). "
-            "Reload SPXL hard on drawdowns (maximum recovery leverage)."
+            "**The Opportunistic Predator** — scale into SPXL in tiers as the market crashes. "
+            "Each tier is a deliberate buying decision. At max drawdown you are 100% in the 3x coiled spring. "
+            "When it bounces, you teleport past your pre-crash balance."
         )
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("##### SPXL at ATH (neutral zone)")
-            spxl_base = st.slider("SPXL % when at ATH", 50, 100, 90, 5,
-                help="Your base allocation when the market is exactly at its all-time high.")
-            spxl_floor = st.slider("Min SPXL % (well above ATH)", 0, 50, 10, 5,
-                help="Floor — how little SPXL you hold when market is well extended above ATH.")
-            ath_max = st.slider("% above ATH to hit floor", 5, 30, 15, 5,
-                help="How far above ATH before SPXL allocation reaches the floor.")
+        st.markdown("##### Tier table — set your SPXL % at each drawdown level")
+        st.caption("Between tiers the allocation scales linearly. Edit any value to tune for max CAGR.")
 
-        with c2:
-            st.markdown("##### Drawdown reload")
-            dd_max = st.slider("Drawdown → 100% SPXL (%)", 15, 60, 40, 5,
-                help="How far below ATH before allocation reaches 100% SPXL.")
+        tier_cols = st.columns(4)
+        tier_labels  = ["At ATH (0%)", "Drop -10%", "Drop -20%", "Drop -30%+"]
+        tier_dd      = [0.00, 0.10, 0.20, 0.30]
+        tier_defaults= [10,   21,   40,   100]
+        tier_helps   = [
+            "Safety mode — minimise vol drag at market highs",
+            "Scout position — first 3x kicker when market dips",
+            "Aggressive — meaningful leverage at real correction",
+            "All-in — maximum coiled spring at bear market bottom",
+        ]
 
-            # live preview table
-            st.markdown("**Allocation preview:**")
-            preview_rows = ""
-            for label, dd, ath in [
-                ("Well above ATH +{}%".format(ath_max), 0, ath_max/100),
-                ("At ATH", 0, 0),
-                ("-10% from ATH", 10, 0),
-                ("-20% from ATH", 20, 0),
-                ("-{}% from ATH".format(dd_max), dd_max, 0),
-            ]:
-                if ath > 0:
-                    t = min(ath / (ath_max/100), 1.0)
-                    spxl = spxl_base - t * (spxl_base - spxl_floor)
-                else:
-                    t = min((dd/100) / (dd_max/100), 1.0)
-                    spxl = spxl_base + t * (100 - spxl_base)
-                spxl = int(np.clip(spxl, spxl_floor, 100))
-                preview_rows += "| {} | {}% SPXL / {}% VOO |\n".format(label, spxl, 100-spxl)
-            st.markdown("| Market level | Allocation |\n|---|---|\n" + preview_rows)
+        tier_vals = []
+        for i, col in enumerate(tier_cols):
+            with col:
+                v = st.slider(
+                    tier_labels[i],
+                    min_value=0, max_value=100,
+                    value=tier_defaults[i], step=1,
+                    help=tier_helps[i],
+                    key=f"tier_{i}",
+                )
+                tier_vals.append(v)
+                st.caption(f"VOO {100-v}% · SPXL {v}%")
 
-        with c3:
-            st.markdown("##### Simulation")
-            sb_paths = st.select_slider("Monte Carlo paths", options=[100, 200, 300, 500], value=200)
+        tiers_input = list(zip(tier_dd, tier_vals))
 
-        with st.spinner(f"Running {sb_paths} paths..."):
+        sb_col1, sb_col2 = st.columns([1, 3])
+        with sb_col1:
+            sb_paths = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
+            rebal_sp = st.slider("Monthly rebal speed", 10, 60, 30, 10,
+                help="% of allocation gap closed each month. 30% = ~3 months to reach target.") / 100
+
+        # Live preview — show what happens at key crash levels
+        with sb_col2:
+            st.markdown("**Live allocation preview:**")
+            preview_data = []
+            crash_levels = [0, 5, 10, 15, 20, 25, 30, 35, 40]
+            for dd_pct in crash_levels:
+                spxl_v = _tier_spxl(dd_pct/100, tiers_input)
+                monthly_spxl = monthly_inv * spxl_v / 100
+                monthly_voo  = monthly_inv * (1 - spxl_v/100)
+                bounce_10    = spxl_v/100 * 30 + (1 - spxl_v/100) * 10  # approx portfolio return on 10% bounce
+                preview_data.append({
+                    "Drop from ATH": f"-{dd_pct}%",
+                    "SPXL alloc": f"{spxl_v:.0f}%",
+                    "VOO alloc": f"{100-spxl_v:.0f}%",
+                    f"DCA (${monthly_inv}/mo)": f"${monthly_spxl:.0f} SPXL / ${monthly_voo:.0f} VOO",
+                    "10% bounce → portfolio": f"+{bounce_10:.1f}%",
+                })
+            st.dataframe(pd.DataFrame(preview_data), hide_index=True, use_container_width=True)
+
+        with st.spinner(f"Running {sb_paths} Monte Carlo paths..."):
             sb = run_springboard(
                 proj_years, monthly_inv, ann_ret, ann_vol,
                 voo_expense, spxl_expense, leverage,
-                spxl_base_pct = spxl_base  / 100,
-                spxl_floor    = spxl_floor / 100,
-                ath_max       = ath_max    / 100,
-                dd_max        = dd_max     / 100,
-                n_paths       = sb_paths,
+                tiers=tiers_input,
+                rebal_speed=rebal_sp,
+                n_paths=sb_paths,
             )
 
-        sp50      = float(sb["spring_p50"][-1])
-        vp50      = float(sb["voo_p50"][-1])
+        sp50     = float(sb["spring_p50"][-1])
+        vp50     = float(sb["voo_p50"][-1])
         total_inv_sb = monthly_inv * (proj_years * 252 // 21)
-        cagr_sb   = (sp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
-        cagr_voo  = (vp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
-        avg_spxl  = float(np.mean(sb["spxl_alloc_p50"]) * 100)
+        cagr_sb  = (sp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+        cagr_voo = (vp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
 
         k = st.columns(5)
-        kpi(k[0], "Springboard P50",  fmt_currency(sp50),                        "median final value",            "#00ff9f")
-        kpi(k[1], "Est. CAGR",        f"{cagr_sb*100:.1f}%",                     f"vs VOO-only {cagr_voo*100:.1f}%", "#00ffcc")
-        kpi(k[2], "P10 Downside",     fmt_currency(float(sb["spring_p10"][-1])), "worst 10%",                     "#f5a623")
-        kpi(k[3], "P90 Upside",       fmt_currency(float(sb["spring_p90"][-1])), "best 10%",                      "#00d4a0")
-        kpi(k[4], "Avg SPXL alloc",   f"{avg_spxl:.0f}%",                        "median path average",           "#ff4b4b")
+        kpi(k[0], "Springboard P50",  fmt_currency(sp50),                        "median final value",                "#00ff9f")
+        kpi(k[1], "Est. CAGR",        f"{cagr_sb*100:.1f}%",                     f"vs VOO-only {cagr_voo*100:.1f}%",  "#00ffcc")
+        kpi(k[2], "P10 Downside",     fmt_currency(float(sb["spring_p10"][-1])), "worst 10% of paths",                "#f5a623")
+        kpi(k[3], "P90 Upside",       fmt_currency(float(sb["spring_p90"][-1])), "best 10% of paths",                 "#00d4a0")
+        kpi(k[4], "Avg SPXL alloc",   f"{sb['avg_spxl']:.0f}%",                  "median path average",               "#ff4b4b")
 
         x_axis = np.linspace(0, proj_years, len(sb["spring_p50"]))
 
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p90"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p10"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.08)", line=dict(width=0), name="P10–P90"))
+                                  fillcolor="rgba(0,255,159,0.07)", line=dict(width=0), name="P10–P90"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p25"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p75"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.16)", line=dict(width=0), name="P25–P75"))
+                                  fillcolor="rgba(0,255,159,0.15)", line=dict(width=0), name="P25–P75"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p50"],
-                                  name="Springboard P50", line=dict(color="#00ff9f", width=2.5)))
+                                  name="Tiered strategy P50", line=dict(color="#00ff9f", width=2.5)))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["voo_p50"],
                                   name="VOO-only baseline", line=dict(color="#888", width=1.5, dash="dash")))
         fig3.update_layout(
-            template="plotly_dark", height=360,
+            template="plotly_dark", height=340,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -766,7 +857,7 @@ def main():
         fig3.update_yaxes(tickprefix="$")
         st.plotly_chart(fig3, use_container_width=True)
 
-        st.markdown("##### SPXL allocation % over time (median path)")
+        st.markdown("##### SPXL allocation % over time (median simulation path)")
         alloc_pct = sb["spxl_alloc_p50"] * 100
         fig_alloc = go.Figure()
         fig_alloc.add_trace(go.Scatter(
@@ -774,27 +865,92 @@ def main():
             fill="tozeroy", fillcolor="rgba(0,212,255,0.12)",
             line=dict(color="#00d4ff", width=1.5),
         ))
-        fig_alloc.add_hline(y=spxl_base,  line=dict(color="#00ff9f", width=1, dash="dot"),
-                            annotation_text=f"ATH base {spxl_base}%",  annotation_position="right")
-        fig_alloc.add_hline(y=spxl_floor, line=dict(color="#888",    width=1, dash="dot"),
-                            annotation_text=f"floor {spxl_floor}%",    annotation_position="right")
-        fig_alloc.add_hline(y=100,        line=dict(color="#ff4b4b",  width=1, dash="dot"),
-                            annotation_text="100% SPXL",               annotation_position="right")
+        for dd, pct in tiers_input:
+            fig_alloc.add_hline(
+                y=pct, line=dict(color="#444", width=1, dash="dot"),
+                annotation_text=f"T{int(dd*100)}% → {pct}%",
+                annotation_position="right",
+            )
         fig_alloc.update_layout(
-            template="plotly_dark", height=170,
+            template="plotly_dark", height=160,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
-            margin=dict(l=10, r=10, t=10, b=10),
+            margin=dict(l=10, r=10, t=20, b=10),
             yaxis=dict(range=[0, 105], ticksuffix="%"),
             showlegend=False,
         )
         fig_alloc.update_xaxes(title_text="Year")
         st.plotly_chart(fig_alloc, use_container_width=True)
 
-        st.caption(
-            "Allocation dips toward the floor during extended bull runs (high ATH premium = high vol drag risk). "
-            "Spikes to 100% during crashes — exactly when 3x leverage earns the most on recovery. "
-            "Soft monthly rebalancing (20% of gap) avoids whipsaw from daily rebalancing."
-        )
+        # Real historical backtest with same tiers
+        st.markdown("---")
+        st.markdown("### Real historical result (2010–today) with these exact tiers")
+        if not prices.empty if "prices" in dir() else False:
+            pass
+
+        with st.spinner("Running real backtest..."):
+            try:
+                prices_cached = load_historical()
+                if not prices_cached.empty:
+                    rot = run_ath_rotation_backtest(
+                        prices_cached, monthly_inv,
+                        tiers=tiers_input,
+                        rebal_speed=rebal_sp,
+                    )
+                    rot_final    = float(rot["Strategy"].iloc[-1])
+                    voo_pur_fin  = float(rot["VOO_pure"].iloc[-1])
+                    spxl_pur_fin = float(rot["SPXL_pure"].iloc[-1])
+                    rot_inv      = float(rot["Invested"].iloc[-1])
+
+                    rk = st.columns(4)
+                    kpi(rk[0], "Strategy final",    fmt_currency(rot_final),                         f"{rot_final/rot_inv:.2f}x invested",       "#00ff9f")
+                    kpi(rk[1], "vs pure VOO DCA",   f"{rot_final/max(voo_pur_fin,1):.2f}x",         fmt_currency(voo_pur_fin),                   "#00ffcc")
+                    kpi(rk[2], "vs pure SPXL DCA",  f"{rot_final/max(spxl_pur_fin,1):.2f}x",        fmt_currency(spxl_pur_fin),                  "#f5a623")
+                    kpi(rk[3], "Total invested",     fmt_currency(rot_inv),                           "single instrument",                         "#aaaaaa")
+
+                    fig_rot = go.Figure()
+                    fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["Strategy"],
+                        name="Tiered strategy", line=dict(color="#00ff9f", width=2.5)))
+                    fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["SPXL_pure"],
+                        name="Pure SPXL DCA", line=dict(color="#00d4ff", width=1.5, dash="dash")))
+                    fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["VOO_pure"],
+                        name="Pure VOO DCA", line=dict(color="#888", width=1.5, dash="dot")))
+                    fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["Invested"],
+                        name="Invested", line=dict(color="#333", width=1, dash="dash")))
+                    fig_rot.update_layout(
+                        template="plotly_dark", height=320,
+                        paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    fig_rot.update_yaxes(tickprefix="$")
+                    st.plotly_chart(fig_rot, use_container_width=True)
+
+                    st.markdown("##### SPXL allocation % — actual history")
+                    fig_ra = go.Figure()
+                    fig_ra.add_trace(go.Scatter(
+                        x=rot.index, y=rot["SPXL_alloc"],
+                        fill="tozeroy", fillcolor="rgba(0,212,255,0.12)",
+                        line=dict(color="#00d4ff", width=1.2),
+                    ))
+                    for dd, pct in tiers_input:
+                        fig_ra.add_hline(y=pct, line=dict(color="#444", width=1, dash="dot"),
+                                         annotation_text=f"{pct}%", annotation_position="right")
+                    fig_ra.update_layout(
+                        template="plotly_dark", height=140,
+                        paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
+                        margin=dict(l=10, r=10, t=10, b=10),
+                        yaxis=dict(range=[0, 105], ticksuffix="%"),
+                        showlegend=False,
+                    )
+                    st.plotly_chart(fig_ra, use_container_width=True)
+                    st.caption(
+                        "Spikes = Mar 2020 (-34%), Q4 2018 (-20%), 2022 bear (-25%). "
+                        "Those are the coiled spring moments. Drag the tier sliders and watch the final number change."
+                    )
+                else:
+                    st.info("Historical data unavailable — deploy to Streamlit Cloud or run locally to see real backtest here.")
+            except Exception as e:
+                st.warning(f"Historical backtest skipped: {e}")
     # -------------------------------------------------------------------------
     # TAB 4: THE MATH
     # -------------------------------------------------------------------------
