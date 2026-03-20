@@ -171,16 +171,23 @@ def kpi(col, label, val, sub=None, color="#e8eaf0"):
 
 
 # =============================================================================
-# SPRINGBOARD ENGINE
+# SPRINGBOARD ENGINE — simplified: pullback re-entry + VOO/SPXL allocation split
 # =============================================================================
 def run_springboard(
     years, monthly, ann_r, ann_s,
     voo_exp, spxl_exp, lev,
-    ma_days=200, vix_thresh=0.18,
-    pullback_pct=0.05, monthly_mult=1.5,
-    mom_days=10, spxl_alloc=1.0,
+    pullback_pct=0.05,
+    voo_alloc=0.0, spxl_alloc=1.0,
     n_paths=200, seed=42,
 ):
+    """
+    Signal logic (two rules only):
+      ENTER SPXL regime: price crosses above MA200
+      RE-ENTER after pullback: price dips >pullback_pct% below rolling peak, then recovers above MA200
+      EXIT: price closes below MA200
+    In SPXL regime: portfolio = spxl_alloc in SPXL + voo_alloc in VOO
+    Out of regime: 100% VOO
+    """
     rng = np.random.default_rng(seed)
     days = years * 252
     dt = 1 / 252
@@ -194,7 +201,6 @@ def run_springboard(
     sig_spxl = lev * ann_s * np.sqrt(dt)
 
     all_voo = np.zeros((days + 1, n_paths))
-    all_spxl = np.zeros((days + 1, n_paths))
     all_spring = np.zeros((days + 1, n_paths))
     lev_frac = np.zeros(n_paths)
 
@@ -203,55 +209,54 @@ def run_springboard(
     for p in range(n_paths):
         spx = np.concatenate([[1.0], np.exp(np.cumsum(drift_spx + sigma_spx * Z[:, p]))])
         spx_s = pd.Series(spx)
-        ma = spx_s.rolling(ma_days, min_periods=1).mean().values
-        peak = spx_s.rolling(ma_days, min_periods=1).max().values
-        log_r = np.diff(np.log(np.maximum(spx, 1e-10)))
-        rv = pd.Series(np.concatenate([[0.0], log_r])).rolling(20, min_periods=5).std().values * np.sqrt(252)
-        mom = spx_s.pct_change(mom_days).fillna(0).values
+        ma200 = spx_s.rolling(200, min_periods=1).mean().values
+        rolling_peak = spx_s.rolling(200, min_periods=1).max().values
 
-        voo_val = spxl_val = spring_val = 0.0
+        voo_val = spring_val = 0.0
         in_lev = False
+        saw_pullback = False
         lev_days_p = 0
 
         for i in range(days):
             if i > 0 and i % 21 == 0:
-                contrib = monthly * (monthly_mult if in_lev else 1.0)
                 voo_val += monthly
-                spxl_val += monthly
-                spring_val += contrib
+                spring_val += monthly
 
             r_voo = drift_voo + sig_voo * Z[i, p]
             r_spxl = drift_spxl + sig_spxl * Z[i, p]
 
             voo_val = max(voo_val * np.exp(r_voo), 0)
-            spxl_val = max(spxl_val * np.exp(r_spxl), 0)
 
             if in_lev:
-                spring_val = max(spring_val * np.exp(r_spxl * spxl_alloc + r_voo * (1 - spxl_alloc)), 0)
+                spring_val = max(spring_val * np.exp(r_spxl * spxl_alloc + r_voo * voo_alloc), 0)
                 lev_days_p += 1
             else:
                 spring_val = max(spring_val * np.exp(r_voo), 0)
 
             all_voo[i + 1, p] = voo_val
-            all_spxl[i + 1, p] = spxl_val
             all_spring[i + 1, p] = spring_val
 
             curr = spx[i + 1]
-            core_signal = (curr > ma[i + 1]) and (rv[i + 1] < vix_thresh) and (mom[i + 1] > 0)
-            pullback_ok = curr < peak[i + 1] * (1 - pullback_pct)
+            above_ma = curr > ma200[i + 1]
+            in_pullback = curr < rolling_peak[i + 1] * (1 - pullback_pct)
 
             if in_lev:
-                if not core_signal:
+                if not above_ma:
                     in_lev = False
+                    saw_pullback = False
             else:
-                if core_signal or (curr > ma[i + 1] and pullback_ok):
-                    in_lev = True
+                if in_pullback:
+                    saw_pullback = True
+                if above_ma and (not in_lev):
+                    # Enter on initial MA cross OR after a pullback re-entry
+                    if saw_pullback or curr > ma200[i + 1]:
+                        in_lev = True
+                        saw_pullback = False
 
         lev_frac[p] = lev_days_p / days
 
     return {
         "voo_p50": np.percentile(all_voo, 50, axis=1),
-        "spxl_p50": np.percentile(all_spxl, 50, axis=1),
         "spring_p10": np.percentile(all_spring, 10, axis=1),
         "spring_p25": np.percentile(all_spring, 25, axis=1),
         "spring_p50": np.percentile(all_spring, 50, axis=1),
@@ -400,52 +405,72 @@ def main():
         st.plotly_chart(fig2, use_container_width=True)
 
     # -------------------------------------------------------------------------
-    # TAB 3: SPRINGBOARD P200
+    # TAB 3: SPRINGBOARD — simplified
     # -------------------------------------------------------------------------
     with tab3:
-        st.markdown("**Springboard P200 + Volatility Edge + Turbo DCA** — MA trend filter · vol gate · momentum · pullback re-entry.")
+        st.markdown("**Springboard MA200** — two rules: MA200 trend entry/exit · pullback re-entry. Tune allocation split for max CAGR.")
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            ma_days = st.slider("MA Trend Filter (days)", 50, 400, 200, 10)
-            vix_thresh = st.slider("Vol Filter Threshold (%)", 10.0, 40.0, 18.0, 1.0) / 100
-            mom_days = st.slider("Momentum Window (days)", 5, 30, 10)
+            st.markdown("##### Pullback re-entry")
+            pullback_pct_sb = st.slider(
+                "Pullback depth to flag re-entry (%)", 2.0, 25.0, 5.0, 1.0,
+                help="How far price must dip below its rolling peak before a re-entry is flagged on the next MA200 cross.",
+            ) / 100
         with c2:
-            pullback_pct = st.slider("Pullback Re-entry (%)", 2.0, 20.0, 5.0, 1.0) / 100
-            monthly_mult = st.slider("DCA Multiplier in SPXL", 1.0, 3.0, 1.5, 0.1)
+            st.markdown("##### Allocation when signal is ON")
+            spxl_alloc_sb = st.slider("SPXL %", 0, 100, 100, 5,
+                help="% allocated to SPXL when above MA200. Remainder goes to VOO.") / 100
+            voo_alloc_sb = 1.0 - spxl_alloc_sb
+            st.caption(f"→ SPXL {spxl_alloc_sb*100:.0f}% · VOO {voo_alloc_sb*100:.0f}%")
         with c3:
-            spxl_alloc = st.slider("SPXL Allocation (%)", 50, 100, 100, 5) / 100
-            sb_paths = st.select_slider("Monte Carlo Paths", options=[100, 200, 300, 500], value=200)
+            st.markdown("##### Simulation")
+            sb_paths = st.select_slider("Monte Carlo paths", options=[100, 200, 300, 500], value=200)
 
-        with st.spinner(f"Running {sb_paths} Springboard paths..."):
+        with st.spinner(f"Running {sb_paths} paths..."):
             sb = run_springboard(
                 proj_years, monthly_inv, ann_ret, ann_vol,
                 voo_expense, spxl_expense, leverage,
-                ma_days, vix_thresh, pullback_pct, monthly_mult,
-                mom_days, spxl_alloc, sb_paths,
+                pullback_pct=pullback_pct_sb,
+                voo_alloc=voo_alloc_sb,
+                spxl_alloc=spxl_alloc_sb,
+                n_paths=sb_paths,
             )
 
         sp50 = float(sb["spring_p50"][-1])
         vp50 = float(sb["voo_p50"][-1])
         total_inv = monthly_inv * (proj_years * 252 // 21)
+        cagr_sb = (sp50 / total_inv) ** (1 / proj_years) - 1 if total_inv > 0 else 0
+        cagr_voo = (vp50 / total_inv) ** (1 / proj_years) - 1 if total_inv > 0 else 0
 
         k = st.columns(5)
         kpi(k[0], "Springboard P50", fmt_currency(sp50), "median final value", "#00ff9f")
-        kpi(k[1], "vs VOO", f"{sp50/vp50:.2f}x", fmt_currency(vp50) + " VOO", "#00ffcc")
+        kpi(k[1], "Est. CAGR", f"{cagr_sb*100:.1f}%", f"vs VOO {cagr_voo*100:.1f}%", "#00ffcc")
         kpi(k[2], "P10 Downside", fmt_currency(float(sb["spring_p10"][-1])), "worst 10%", "#f5a623")
         kpi(k[3], "P90 Upside", fmt_currency(float(sb["spring_p90"][-1])), "best 10%", "#00d4a0")
-        kpi(k[4], "Time in SPXL", f"{sb['lev_pct_median']:.0f}%", "in strong trends", "#ff4b4b")
+        kpi(k[4], "Time in SPXL", f"{sb['lev_pct_median']:.0f}%", "of trading days", "#ff4b4b")
 
         x_axis = np.linspace(0, proj_years, len(sb["spring_p50"]))
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p90"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p10"], fill="tonexty", fillcolor="rgba(0,255,159,0.1)", line=dict(width=0), name="Springboard P10–P90"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p50"], name="Springboard P50", line=dict(color="#00ff9f", width=2.5)))
-        fig3.add_trace(go.Scatter(x=x_axis, y=sb["voo_p50"], name="VOO P50", line=dict(color="#888", width=1.5, dash="dash")))
-        fig3.update_layout(template="plotly_dark", height=420, paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14", margin=dict(l=10, r=10, t=10, b=10))
+        fig3.add_trace(go.Scatter(x=x_axis, y=sb["voo_p50"], name="VOO baseline", line=dict(color="#888", width=1.5, dash="dash")))
+        fig3.update_layout(
+            template="plotly_dark", height=420,
+            paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
         fig3.update_xaxes(title_text="Year")
         fig3.update_yaxes(tickprefix="$")
         st.plotly_chart(fig3, use_container_width=True)
+
+        st.info(
+            f"**How to tune for max CAGR:** drag SPXL % up toward 100% in strong bull markets (low vol, high return assumptions). "
+            f"Pull it back toward 70–80% if vol is high (>20%) to reduce drag. "
+            f"Pullback depth of 5–8% catches most healthy corrections without whipsawing."
+        )
 
     # -------------------------------------------------------------------------
     # TAB 4: THE MATH
