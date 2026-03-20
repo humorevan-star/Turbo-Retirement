@@ -148,173 +148,6 @@ def generate_signals(prices: pd.DataFrame, ma_days=200) -> pd.DataFrame:
     return pd.DataFrame(signals, columns=["Date", "Type", "Price"]).set_index("Date")
 
 
-def run_ath_rotation_backtest(
-    prices: pd.DataFrame,
-    monthly: float,
-    spxl_base_pct: float = 0.90,
-    spxl_floor: float = 0.10,
-    ath_max: float = 0.15,
-    dd_max: float = 0.40,
-) -> pd.DataFrame:
-    """
-    Real historical backtest of the ATH Rotation strategy.
-    Uses actual VOO + SPXL prices. Dollar-value portfolio, not shares.
-    Each month: contribute monthly * target_spxl to SPXL bucket, rest to VOO bucket.
-    Soft rebalance 20% of gap toward target each month.
-    """
-    voo_bucket  = 0.0
-    spxl_bucket = 0.0
-    voo_ath     = None   # ATH of VOO price
-    last_month  = -1
-
-    results = {"Date": [], "Strategy": [], "Invested": [], "SPXL_alloc": [],
-               "VOO_pure": [], "SPXL_pure": []}
-    voo_shares_pure  = 0.0
-    spxl_shares_pure = 0.0
-    invested = 0.0
-
-    for date, row in prices.iterrows():
-        voo_price  = float(row.get("VOO",  0))
-        spxl_price = float(row.get("SPXL", 0))
-        if voo_price <= 0 or spxl_price <= 0:
-            continue
-
-        # track ATH of VOO price
-        if voo_ath is None:
-            voo_ath = voo_price
-        else:
-            voo_ath = max(voo_ath, voo_price)
-
-        dd          = max(0.0, (voo_ath - voo_price) / voo_ath)
-        ath_premium = max(0.0, (voo_price - voo_ath) / voo_ath)  # always 0 since ath tracks max
-
-        if dd > 0:
-            t = min(dd / dd_max, 1.0)
-            target_spxl = spxl_base_pct + t * (1.0 - spxl_base_pct)
-        else:
-            t = min(ath_premium / ath_max, 1.0)
-            target_spxl = spxl_base_pct - t * (spxl_base_pct - spxl_floor)
-
-        target_spxl = float(np.clip(target_spxl, spxl_floor, 1.0))
-
-        m = date.month
-        if m != last_month:
-            # DCA at target ratio
-            spxl_bucket += monthly * target_spxl
-            voo_bucket  += monthly * (1.0 - target_spxl)
-            invested    += monthly
-
-            # pure benchmarks
-            if voo_price  > 0: voo_shares_pure  += monthly / voo_price
-            if spxl_price > 0: spxl_shares_pure += monthly / spxl_price
-
-            # soft rebalance: close 20% of gap
-            total = voo_bucket + spxl_bucket
-            if total > 0:
-                current_spxl = spxl_bucket / total
-                gap   = target_spxl - current_spxl
-                rebal = total * gap * 0.20
-                # rebal is positive → move from VOO to SPXL
-                # convert dollar rebal into shares
-                if rebal > 0 and voo_bucket >= rebal:
-                    spxl_bucket += rebal
-                    voo_bucket  -= rebal
-                elif rebal < 0 and spxl_bucket >= abs(rebal):
-                    voo_bucket  += abs(rebal)
-                    spxl_bucket -= abs(rebal)
-
-            last_month = m
-
-        # grow buckets daily by price change
-        # (we track dollar value, so just mark-to-market via return)
-        # use previous close to compute daily return
-        pass  # price appreciation handled via portfolio value below
-
-        total_val   = voo_bucket + spxl_bucket
-        spxl_frac   = spxl_bucket / total_val if total_val > 0 else target_spxl
-
-        results["Date"].append(date)
-        results["Strategy"].append(round(total_val, 2))
-        results["Invested"].append(round(invested, 2))
-        results["SPXL_alloc"].append(round(spxl_frac * 100, 1))
-        results["VOO_pure"].append(round(voo_shares_pure * voo_price, 2))
-        results["SPXL_pure"].append(round(spxl_shares_pure * spxl_price, 2))
-
-    df_out = pd.DataFrame(results).set_index("Date")
-
-    # Apply daily returns to buckets properly using vectorised price returns
-    # Re-run properly with daily price-return compounding
-    voo_prices  = prices["VOO"].values
-    spxl_prices = prices["SPXL"].values
-    dates       = prices.index
-
-    voo_b = 0.0; spxl_b = 0.0; voo_ath2 = None; lm = -1
-    invested2 = 0.0
-    out_strategy = np.zeros(len(dates))
-    out_alloc    = np.zeros(len(dates))
-
-    for i, date in enumerate(dates):
-        vp = voo_prices[i]; sp = spxl_prices[i]
-        if vp <= 0 or sp <= 0:
-            out_strategy[i] = voo_b + spxl_b
-            out_alloc[i]    = spxl_b / max(voo_b + spxl_b, 1)
-            continue
-
-        # daily price return
-        if i > 0:
-            voo_ret  = vp / voo_prices[i-1]  if voo_prices[i-1]  > 0 else 1.0
-            spxl_ret = sp / spxl_prices[i-1] if spxl_prices[i-1] > 0 else 1.0
-            voo_b  *= voo_ret
-            spxl_b *= spxl_ret
-
-        voo_ath2 = max(voo_ath2, vp) if voo_ath2 else vp
-        dd2  = max(0.0, (voo_ath2 - vp) / voo_ath2)
-        atp2 = 0.0  # vp always <= voo_ath2
-
-        if dd2 > 0:
-            t2 = min(dd2 / dd_max, 1.0)
-            tgt = spxl_base_pct + t2 * (1.0 - spxl_base_pct)
-        else:
-            tgt = spxl_base_pct
-
-        tgt = float(np.clip(tgt, spxl_floor, 1.0))
-
-        if date.month != lm:
-            spxl_b   += monthly * tgt
-            voo_b    += monthly * (1.0 - tgt)
-            invested2 += monthly
-            total2 = voo_b + spxl_b
-            if total2 > 0:
-                cur = spxl_b / total2
-                gap = tgt - cur
-                rb  = total2 * gap * 0.20
-                if rb > 0 and voo_b >= rb:
-                    spxl_b += rb; voo_b -= rb
-                elif rb < 0 and spxl_b >= abs(rb):
-                    voo_b += abs(rb); spxl_b -= abs(rb)
-            lm = date.month
-
-        total2 = voo_b + spxl_b
-        out_strategy[i] = total2
-        out_alloc[i]    = spxl_b / total2 if total2 > 0 else tgt
-
-    df2 = pd.DataFrame({
-        "Strategy":  np.round(out_strategy, 2),
-        "Invested":  0.0,  # filled below
-        "SPXL_alloc": np.round(out_alloc * 100, 1),
-        "VOO_pure":  df_out["VOO_pure"].values,
-        "SPXL_pure": df_out["SPXL_pure"].values,
-    }, index=dates)
-
-    # rebuild invested
-    inv = 0.0; lm2 = -1
-    inv_arr = []
-    for date in dates:
-        if date.month != lm2:
-            inv += monthly; lm2 = date.month
-        inv_arr.append(inv)
-    df2["Invested"] = inv_arr
-    return df2
 
 
 def fmt_currency(v: float) -> str:
@@ -641,22 +474,26 @@ def main():
                 st.markdown("### ATH Rotation strategy — real historical backtest")
                 st.caption("Same prices, different strategy: shift VOO value to SPXL during drawdowns, reduce SPXL when above ATH.")
 
-                rot_c1, rot_c2, rot_c3, rot_c4 = st.columns(4)
+                rot_c1, rot_c2 = st.columns(2)
                 with rot_c1:
-                    rot_base  = st.slider("SPXL % at ATH", 50, 100, 90, 5, key="rot_base")
+                    rot_base = st.slider("SPXL % at ATH (base)", 0, 100, 10, 5, key="rot_base",
+                        help="Allocation when market is at all-time high.")
                 with rot_c2:
-                    rot_floor = st.slider("Min SPXL % above ATH", 0, 40, 10, 5, key="rot_floor")
-                with rot_c3:
-                    rot_ath   = st.slider("% above ATH → floor", 5, 30, 15, 5, key="rot_ath")
-                with rot_c4:
-                    rot_dd    = st.slider("% drawdown → 100% SPXL", 15, 60, 40, 5, key="rot_dd")
+                    rot_dd = st.slider("Drawdown % → 100% SPXL", 15, 60, 30, 5, key="rot_dd",
+                        help="How far below ATH before you reach 100% SPXL.")
 
+                # Build a simple 4-tier table from the sliders
+                rot_tiers = [
+                    (0.00, rot_base),
+                    (0.10, min(100, rot_base + (100 - rot_base) * (0.10 / (rot_dd/100)))),
+                    (0.20, min(100, rot_base + (100 - rot_base) * (0.20 / (rot_dd/100)))),
+                    (rot_dd / 100, 100),
+                ]
+                rot_tiers = [(dd, int(round(pct))) for dd, pct in rot_tiers]
                 rot = run_ath_rotation_backtest(
                     prices, monthly_inv,
-                    spxl_base_pct = rot_base  / 100,
-                    spxl_floor    = rot_floor / 100,
-                    ath_max       = rot_ath   / 100,
-                    dd_max        = rot_dd    / 100,
+                    tiers=rot_tiers,
+                    rebal_speed=0.30,
                 )
 
                 rot_final    = float(rot["Strategy"].iloc[-1])
