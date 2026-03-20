@@ -185,37 +185,29 @@ def kpi(col, label, val, sub=None, color="#e8eaf0"):
 
 
 # =============================================================================
-# SPRINGBOARD ENGINE — Tiered Drawdown Scaling ("Opportunistic Predator")
+# SPRINGBOARD ENGINE v4 — "Opportunistic Predator" with Profit Lock
 # =============================================================================
-# Tiers are defined as (drawdown_threshold, spxl_pct_of_total_portfolio)
-# Between tiers: linear interpolation (smooth scaling)
-# Above ATH: hold at base (t0 allocation), gradually rotate toward voo_cruise
+# FULL CYCLE:
+#   BASE STATE:  100% VOO — accumulate war chest, zero vol decay, minimal fees
+#   TIER ENTRY:  As market drops from 50-day high, shift VOO → SPXL in chunks
+#     -10%  → 20% of current VOO bucket moves to SPXL
+#     -20%  → 40% of remaining VOO moves to SPXL
+#     -30%  → 100% remaining VOO moves to SPXL (full coiled spring)
+#   PROFIT LOCK: When market hits new ALL-TIME HIGH → exit SPXL → back to 100% VOO
+#                Whipsaw guard: must be >5 days since last tier entry before locking
 #
-# Default tiers (all tunable):
-#   ATH        →  10% SPXL  (safety accumulation, minimise vol drag)
-#   -10% ATH   →  21% SPXL  (scout position)
-#   -20% ATH   →  40% SPXL  (aggressive entry)
-#   -30% ATH   → 100% SPXL  (all-in, coiled spring)
-#
-# Monthly DCA follows the same ratio as current tier allocation.
-# Soft monthly rebalance: 30% of gap closed each month (avoids whipsaw).
+# Key difference from v3: tiers are based on DROP FROM 50-DAY HIGH (not ATH)
+# so the system reacts faster to corrections, and the ATH exit creates a clean cycle.
 # =============================================================================
 
-# Default tier table — (drawdown_from_ath, spxl_allocation_pct)
 DEFAULT_TIERS = [
-    (0.00,  10),   # at ATH
-    (0.10,  21),   # -10%
-    (0.20,  40),   # -20%
-    (0.30, 100),   # -30% → all-in
+    (0.00,   0),   # at 50d high → 0% SPXL (100% VOO)
+    (0.10,  20),   # -10% → 20% of VOO shifted to SPXL
+    (0.20,  52),   # -20% → 40% of remaining (0.8 * 0.4 + 0.2 = 52% total SPXL)
+    (0.30, 100),   # -30% → all-in SPXL
 ]
 
 def _tier_spxl(drawdown: float, tiers: list) -> float:
-    """
-    Interpolate SPXL allocation % from tier table.
-    drawdown: 0.0 = at ATH, 0.30 = 30% below ATH
-    Returns value 0.0–100.0 (percent).
-    """
-    # clamp to table range
     if drawdown <= tiers[0][0]:
         return float(tiers[0][1])
     if drawdown >= tiers[-1][0]:
@@ -233,10 +225,11 @@ def run_springboard(
     years, monthly,
     ann_r, ann_s,
     voo_exp, spxl_exp, lev,
-    tiers=None,        # list of (drawdown, spxl_pct) — uses DEFAULT_TIERS if None
-    rebal_speed=0.30,  # fraction of allocation gap closed each month
+    tiers=None,
+    rebal_speed=0.30,
     n_paths=200, seed=42,
-    initial=0,         # lump sum on day 1
+    initial=0,
+    whipsaw_guard=5,   # min days in tier before profit lock can trigger
 ):
     if tiers is None:
         tiers = DEFAULT_TIERS
@@ -254,55 +247,87 @@ def run_springboard(
     sig_idx    = ann_s * np.sqrt(dt)
 
     all_spring     = np.zeros((days+1, n_paths))
-    all_voo_base   = np.zeros((days+1, n_paths))
+    all_voo_base   = np.zeros((days+1, n_paths))  # pure VOO DCA benchmark
+    all_spxl_base  = np.zeros((days+1, n_paths))  # pure SPXL DCA benchmark
     all_spxl_alloc = np.zeros((days+1, n_paths))
 
     Z = rng.standard_normal((days, n_paths))
 
     for p in range(n_paths):
-        # seed with lump sum at day-0 target allocation
-        init_tgt = _tier_spxl(0.0, tiers if tiers else DEFAULT_TIERS) / 100.0
-        voo_b    = initial * (1.0 - init_tgt)
-        spxl_b   = initial * init_tgt
-        voo_base = initial
+        # strategy buckets
+        voo_b = initial * 1.0   # start 100% VOO
+        spxl_b = 0.0
+        # pure benchmarks
+        voo_base  = initial
+        spxl_base = initial
+
         idx = 1.0; idx_ath = 1.0
+        high_50d = np.ones(51)   # rolling 50-day high buffer
+        buf_ptr  = 0
+        days_since_entry = whipsaw_guard + 1
+        locked = False  # profit-lock state
 
         for i in range(days):
             r_voo  = drift_voo  + sig_voo  * Z[i, p]
             r_spxl = drift_spxl + sig_spxl * Z[i, p]
             r_idx  = drift_idx  + sig_idx  * Z[i, p]
 
-            voo_b    = max(voo_b    * np.exp(r_voo),  0.0)
-            spxl_b   = max(spxl_b   * np.exp(r_spxl), 0.0)
-            voo_base = max(voo_base  * np.exp(r_voo),  0.0)
-            idx     *= np.exp(r_idx)
-            idx_ath  = max(idx_ath, idx)
+            voo_b     = max(voo_b    * np.exp(r_voo),  0.0)
+            spxl_b    = max(spxl_b   * np.exp(r_spxl), 0.0)
+            voo_base  = max(voo_base  * np.exp(r_voo),  0.0)
+            spxl_base = max(spxl_base * np.exp(r_spxl), 0.0)
 
-            dd = max(0.0, (idx_ath - idx) / idx_ath)
-            target_spxl = _tier_spxl(dd, tiers) / 100.0
+            idx *= np.exp(r_idx)
+            idx_ath = max(idx_ath, idx)
 
+            # update 50-day rolling high
+            high_50d[buf_ptr % 51] = idx
+            buf_ptr += 1
+            h50 = np.max(high_50d)
+
+            dd_from_50d = max(0.0, (h50 - idx) / h50)
+            at_new_ath  = (idx >= idx_ath * 0.999)  # within 0.1% of ATH = new high
+
+            days_since_entry += 1
+
+            # ── PROFIT LOCK: new ATH → exit all SPXL → 100% VOO ───────────────
+            if at_new_ath and spxl_b > 0 and days_since_entry > whipsaw_guard:
+                voo_b  += spxl_b
+                spxl_b  = 0.0
+                locked  = True
+
+            # ── TIER ENTRY: drawdown from 50d high ────────────────────────────
+            target_spxl_pct = _tier_spxl(dd_from_50d, tiers) / 100.0
+            total = voo_b + spxl_b
+            if total > 0:
+                current_spxl_pct = spxl_b / total
+                if target_spxl_pct > current_spxl_pct + 0.01:  # entering deeper tier
+                    gap = target_spxl_pct - current_spxl_pct
+                    move = total * gap * rebal_speed
+                    if voo_b >= move:
+                        spxl_b += move
+                        voo_b  -= move
+                        days_since_entry = 0
+                        locked = False
+
+            # ── MONTHLY DCA: contribute at current allocation ─────────────────
             if i > 0 and i % 21 == 0:
-                # DCA at tier ratio
-                spxl_b   += monthly * target_spxl
-                voo_b    += monthly * (1.0 - target_spxl)
-                voo_base += monthly
-
-                # soft rebalance
                 total = voo_b + spxl_b
-                if total > 0:
-                    cur_spxl = spxl_b / total
-                    gap  = target_spxl - cur_spxl
-                    rb   = total * gap * rebal_speed
-                    spxl_b = max(spxl_b + rb, 0.0)
-                    voo_b  = max(voo_b  - rb, 0.0)
+                cur_spxl = spxl_b / total if total > 0 else 0.0
+                spxl_b   += monthly * cur_spxl
+                voo_b    += monthly * (1.0 - cur_spxl)
+                voo_base  += monthly
+                spxl_base += monthly
 
             total = voo_b + spxl_b
             all_spring[i+1, p]     = total
             all_voo_base[i+1, p]   = voo_base
-            all_spxl_alloc[i+1, p] = spxl_b / total if total > 0 else target_spxl
+            all_spxl_base[i+1, p]  = spxl_base
+            all_spxl_alloc[i+1, p] = spxl_b / total if total > 0 else 0.0
 
     return {
         "voo_p50":        np.percentile(all_voo_base,    50, axis=1),
+        "spxl_p50":       np.percentile(all_spxl_base,   50, axis=1),
         "spring_p10":     np.percentile(all_spring,      10, axis=1),
         "spring_p25":     np.percentile(all_spring,      25, axis=1),
         "spring_p50":     np.percentile(all_spring,      50, axis=1),
@@ -313,31 +338,42 @@ def run_springboard(
     }
 
 
+def _days_to_target(series: np.ndarray, target: float) -> int:
+    """Return first index where series >= target, or -1 if never reached."""
+    idx = np.where(series >= target)[0]
+    return int(idx[0]) if len(idx) > 0 else -1
+
+
 def run_ath_rotation_backtest(
     prices: pd.DataFrame,
     monthly: float,
     tiers=None,
     rebal_speed: float = 0.30,
     initial: float = 0,
+    whipsaw_guard: int = 5,
 ) -> pd.DataFrame:
-    """Real historical backtest using actual VOO/SPXL prices and tier table."""
+    """Real historical backtest — full Profit Lock cycle on actual prices."""
     if tiers is None:
         tiers = DEFAULT_TIERS
 
-    voo_b = 0.0; spxl_b = 0.0
-    voo_ath = None; lm = -1; invested = 0.0
+    voo_b = initial; spxl_b = 0.0
+    voo_ath = None; lm = -1; invested = initial
     voo_shares_pure = 0.0; spxl_shares_pure = 0.0
-    initial_deployed = False
+    initial_deployed = (initial == 0)
+    days_since_entry = whipsaw_guard + 1
 
-    voo_prices  = prices["VOO"].values
-    spxl_prices = prices["SPXL"].values
-    dates       = prices.index
+    voo_prices   = prices["VOO"].values
+    spxl_prices  = prices["SPXL"].values
+    dates        = prices.index
+    n            = len(dates)
 
-    out_strategy = np.zeros(len(dates))
-    out_alloc    = np.zeros(len(dates))
-    out_invested = np.zeros(len(dates))
-    out_voo_pure = np.zeros(len(dates))
-    out_spxl_pure= np.zeros(len(dates))
+    out_strategy  = np.zeros(n)
+    out_alloc     = np.zeros(n)
+    out_invested  = np.zeros(n)
+    out_voo_pure  = np.zeros(n)
+    out_spxl_pure = np.zeros(n)
+
+    high_50d = None
 
     for i, date in enumerate(dates):
         vp = voo_prices[i]; sp = spxl_prices[i]
@@ -349,53 +385,70 @@ def run_ath_rotation_backtest(
             out_spxl_pure[i] = spxl_shares_pure * sp
             continue
 
-        # daily price-return compounding
-        if i > 0:
-            prev_vp = voo_prices[i-1]; prev_sp = spxl_prices[i-1]
-            if prev_vp > 0: voo_b  *= vp  / prev_vp
-            if prev_sp > 0: spxl_b *= sp  / prev_sp
-
-        voo_ath = max(voo_ath, vp) if voo_ath else vp
-        dd = max(0.0, (voo_ath - vp) / voo_ath)
-        target_spxl = _tier_spxl(dd, tiers) / 100.0
-
-        # Deploy lump sum on first valid day
-        if not initial_deployed and initial > 0 and vp > 0 and sp > 0:
-            spxl_b   += initial * target_spxl
-            voo_b    += initial * (1.0 - target_spxl)
-            invested += initial
-            if vp > 0: voo_shares_pure  += (initial / 2) / vp
-            if sp > 0: spxl_shares_pure += (initial / 2) / sp
+        # deploy lump sum day 1
+        if not initial_deployed and initial > 0:
+            voo_b = initial; spxl_b = 0.0
+            voo_shares_pure  += (initial / 2) / vp
+            spxl_shares_pure += (initial / 2) / sp
             initial_deployed = True
 
+        # daily price-return compounding
+        if i > 0:
+            pv = voo_prices[i-1]; ps = spxl_prices[i-1]
+            if pv > 0: voo_b  *= vp / pv
+            if ps > 0: spxl_b *= sp / ps
+
+        voo_ath = max(voo_ath, vp) if voo_ath else vp
+
+        # 50-day rolling high on VOO price
+        lo = max(0, i - 49)
+        h50 = float(np.max(voo_prices[lo:i+1]))
+        dd_from_50d = max(0.0, (h50 - vp) / h50)
+        at_new_ath  = (vp >= voo_ath * 0.999)
+
+        days_since_entry += 1
+
+        # PROFIT LOCK
+        if at_new_ath and spxl_b > 0 and days_since_entry > whipsaw_guard:
+            voo_b  += spxl_b
+            spxl_b  = 0.0
+
+        # TIER ENTRY
+        target_spxl_pct = _tier_spxl(dd_from_50d, tiers) / 100.0
+        total = voo_b + spxl_b
+        if total > 0:
+            cur_spxl = spxl_b / total
+            if target_spxl_pct > cur_spxl + 0.01:
+                gap  = target_spxl_pct - cur_spxl
+                move = total * gap * rebal_speed
+                if voo_b >= move:
+                    spxl_b += move; voo_b -= move
+                    # convert dollars to fractional shares for tracking
+                    days_since_entry = 0
+
+        # MONTHLY DCA
         if date.month != lm:
-            spxl_b   += monthly * target_spxl
-            voo_b    += monthly * (1.0 - target_spxl)
+            total = voo_b + spxl_b
+            cur_spxl = spxl_b / total if total > 0 else 0.0
+            spxl_b   += monthly * cur_spxl
+            voo_b    += monthly * (1.0 - cur_spxl)
             invested += monthly
             if vp > 0: voo_shares_pure  += monthly / vp
             if sp > 0: spxl_shares_pure += monthly / sp
-
-            total = voo_b + spxl_b
-            if total > 0:
-                cur = spxl_b / total
-                gap = target_spxl - cur
-                rb  = total * gap * rebal_speed
-                if rb > 0 and voo_b  >= rb:  spxl_b += rb; voo_b -= rb
-                elif rb < 0 and spxl_b >= abs(rb): voo_b += abs(rb); spxl_b -= abs(rb)
             lm = date.month
 
         total = voo_b + spxl_b
         out_strategy[i]  = total
-        out_alloc[i]     = spxl_b / total if total > 0 else target_spxl
+        out_alloc[i]     = spxl_b / total if total > 0 else 0.0
         out_invested[i]  = invested
         out_voo_pure[i]  = voo_shares_pure * vp
         out_spxl_pure[i] = spxl_shares_pure * sp
 
     return pd.DataFrame({
-        "Strategy":   np.round(out_strategy, 2),
+        "Strategy":   np.round(out_strategy,  2),
         "SPXL_alloc": np.round(out_alloc * 100, 1),
-        "Invested":   np.round(out_invested, 2),
-        "VOO_pure":   np.round(out_voo_pure, 2),
+        "Invested":   np.round(out_invested,  2),
+        "VOO_pure":   np.round(out_voo_pure,  2),
         "SPXL_pure":  np.round(out_spxl_pure, 2),
     }, index=dates)
 # =============================================================================
@@ -615,68 +668,62 @@ def main():
         st.plotly_chart(fig2, use_container_width=True)
 
     # -------------------------------------------------------------------------
-    # TAB 3: SPRINGBOARD — Tiered Drawdown Scaling
+    # TAB 3: SPRINGBOARD — Opportunistic Predator + Profit Lock
     # -------------------------------------------------------------------------
     with tab3:
         st.markdown(
-            "**The Opportunistic Predator** — scale into SPXL in tiers as the market crashes. "
-            "Each tier is a deliberate buying decision. At max drawdown you are 100% in the 3x coiled spring. "
-            "When it bounces, you teleport past your pre-crash balance."
+            "**The Opportunistic Predator** · Base state: 100% VOO (zero vol decay). "
+            "Scale into SPXL in tiers as market drops from its 50-day high. "
+            "**Profit Lock:** when market hits a new ATH, exit all SPXL → back to 100% VOO. Rinse and repeat."
         )
 
-        st.markdown("##### Tier table — set your SPXL % at each drawdown level")
-        st.caption("Between tiers the allocation scales linearly. Edit any value to tune for max CAGR.")
-
+        st.markdown("##### Tier table — SPXL % at each drop from 50-day high")
         tier_cols = st.columns(4)
-        tier_labels  = ["At ATH (0%)", "Drop -10%", "Drop -20%", "Drop -30%+"]
-        tier_dd      = [0.00, 0.10, 0.20, 0.30]
-        tier_defaults= [10,   21,   40,   100]
-        tier_helps   = [
-            "Safety mode — minimise vol drag at market highs",
-            "Scout position — first 3x kicker when market dips",
-            "Aggressive — meaningful leverage at real correction",
-            "All-in — maximum coiled spring at bear market bottom",
+        tier_labels   = ["At 50d high (0%)", "Drop -10%", "Drop -20%", "Drop -30%+"]
+        tier_dd       = [0.00, 0.10, 0.20, 0.30]
+        tier_defaults = [0, 20, 52, 100]
+        tier_helps    = [
+            "Base state — 100% VOO, zero vol drag",
+            "Scout — first SPXL kicker at -10%",
+            "Aggressive — meaningful leverage at -20%",
+            "All-in — 100% SPXL coiled spring at -30%",
         ]
-
         tier_vals = []
         for i, col in enumerate(tier_cols):
             with col:
-                v = st.slider(
-                    tier_labels[i],
-                    min_value=0, max_value=100,
-                    value=tier_defaults[i], step=1,
-                    help=tier_helps[i],
-                    key=f"tier_{i}",
-                )
+                v = st.slider(tier_labels[i], 0, 100, tier_defaults[i], 1,
+                              help=tier_helps[i], key=f"tier_{i}")
                 tier_vals.append(v)
                 st.caption(f"VOO {100-v}% · SPXL {v}%")
 
         tiers_input = list(zip(tier_dd, tier_vals))
 
-        sb_col1, sb_col2 = st.columns([1, 3])
-        with sb_col1:
-            sb_paths = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
-            rebal_sp = st.slider("Monthly rebal speed", 10, 60, 30, 10,
-                help="% of allocation gap closed each month. 30% = ~3 months to reach target.") / 100
+        ctrl1, ctrl2, ctrl3 = st.columns(3)
+        with ctrl1:
+            sb_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
+            rebal_sp  = st.slider("Rebal speed %/month", 10, 60, 30, 10,
+                help="% of allocation gap closed each month.") / 100
+        with ctrl2:
+            wg = st.slider("Whipsaw guard (days)", 0, 30, 5, 1,
+                help="Min days in a tier before Profit Lock can fire. Prevents selling SPXL immediately after buying.")
+        with ctrl3:
+            target_val = st.number_input("Days-to-target ($)", value=1_000_000, step=100_000,
+                help="The 'Days to Millionaire' comparison target.")
 
-        # Live preview — show what happens at key crash levels
-        with sb_col2:
-            st.markdown("**Live allocation preview:**")
-            preview_data = []
-            crash_levels = [0, 5, 10, 15, 20, 25, 30, 35, 40]
-            for dd_pct in crash_levels:
-                spxl_v = _tier_spxl(dd_pct/100, tiers_input)
-                monthly_spxl = monthly_inv * spxl_v / 100
-                monthly_voo  = monthly_inv * (1 - spxl_v/100)
-                bounce_10    = spxl_v/100 * 30 + (1 - spxl_v/100) * 10  # approx portfolio return on 10% bounce
-                preview_data.append({
-                    "Drop from ATH": f"-{dd_pct}%",
-                    "SPXL alloc": f"{spxl_v:.0f}%",
-                    "VOO alloc": f"{100-spxl_v:.0f}%",
-                    f"DCA (${monthly_inv}/mo)": f"${monthly_spxl:.0f} SPXL / ${monthly_voo:.0f} VOO",
-                    "10% bounce → portfolio": f"+{bounce_10:.1f}%",
-                })
-            st.dataframe(pd.DataFrame(preview_data), hide_index=True, use_container_width=True)
+        # Live allocation preview table
+        st.markdown("**Live allocation preview + recovery math:**")
+        preview_rows = []
+        for dd_pct in [0, 10, 20, 30, 40]:
+            spxl_v   = _tier_spxl(dd_pct / 100, tiers_input)
+            voo_v    = 100 - spxl_v
+            port_bounce_10 = spxl_v / 100 * lev * 10 + voo_v / 100 * 10
+            preview_rows.append({
+                "Drop from 50d high": f"-{dd_pct}%",
+                "SPXL": f"{spxl_v:.0f}%",
+                "VOO":  f"{voo_v:.0f}%",
+                "10% bounce → portfolio gain": f"+{port_bounce_10:.1f}%",
+            })
+        st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
 
         with st.spinner(f"Running {sb_paths} Monte Carlo paths..."):
             sb = run_springboard(
@@ -686,36 +733,65 @@ def main():
                 rebal_speed=rebal_sp,
                 n_paths=sb_paths,
                 initial=initial_inv,
+                whipsaw_guard=wg,
             )
 
-        sp50     = float(sb["spring_p50"][-1])
-        vp50     = float(sb["voo_p50"][-1])
-        total_inv_sb = monthly_inv * (proj_years * 252 // 21)
-        cagr_sb  = (sp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
-        cagr_voo = (vp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+        sp50 = float(sb["spring_p50"][-1])
+        vp50 = float(sb["voo_p50"][-1])
+        xp50 = float(sb["spxl_p50"][-1])
+        total_inv_sb = initial_inv + monthly_inv * (proj_years * 252 // 21)
+        cagr_sb   = (sp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+        cagr_voo  = (vp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+        cagr_spxl = (xp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+
+        # Days-to-target on median path
+        dtm_spring = _days_to_target(sb["spring_p50"], target_val)
+        dtm_spxl   = _days_to_target(sb["spxl_p50"],   target_val)
+        dtm_voo    = _days_to_target(sb["voo_p50"],     target_val)
+
+        def fmt_days(d):
+            if d < 0: return "not reached"
+            yrs = d / 252
+            return f"{yrs:.1f} yrs ({d} days)"
 
         k = st.columns(5)
-        kpi(k[0], "Springboard P50",  fmt_currency(sp50),                        "median final value",                "#00ff9f")
-        kpi(k[1], "Est. CAGR",        f"{cagr_sb*100:.1f}%",                     f"vs VOO-only {cagr_voo*100:.1f}%",  "#00ffcc")
-        kpi(k[2], "P10 Downside",     fmt_currency(float(sb["spring_p10"][-1])), "worst 10% of paths",                "#f5a623")
-        kpi(k[3], "P90 Upside",       fmt_currency(float(sb["spring_p90"][-1])), "best 10% of paths",                 "#00d4a0")
-        kpi(k[4], "Avg SPXL alloc",   f"{sb['avg_spxl']:.0f}%",                  "median path average",               "#ff4b4b")
+        kpi(k[0], "Strategy P50",   fmt_currency(sp50),           f"CAGR {cagr_sb*100:.1f}%",   "#00ff9f")
+        kpi(k[1], "vs Pure SPXL",   f"{sp50/max(xp50,1):.2f}x",  f"{fmt_currency(xp50)} · {cagr_spxl*100:.1f}% CAGR", "#00ffcc")
+        kpi(k[2], "vs Pure VOO",    f"{sp50/max(vp50,1):.2f}x",  f"{fmt_currency(vp50)} · {cagr_voo*100:.1f}% CAGR",  "#aaaaaa")
+        kpi(k[3], "Avg SPXL alloc", f"{sb['avg_spxl']:.0f}%",    "median path",                 "#ff4b4b")
+        kpi(k[4], "P10 Downside",   fmt_currency(float(sb["spring_p10"][-1])), "worst 10%",      "#f5a623")
+
+        # Days to target comparison
+        st.markdown(f"##### Days to ${target_val:,.0f} (median path)")
+        dtm_cols = st.columns(3)
+        def dtm_color(d, others):
+            if d < 0: return "#f5a623"
+            return "#00ff9f" if d == min(x for x in others if x > 0) else "#aaaaaa"
+        all_dtm = [dtm_spring, dtm_spxl, dtm_voo]
+        kpi(dtm_cols[0], "Springboard strategy", fmt_days(dtm_spring), "this strategy",  dtm_color(dtm_spring, all_dtm))
+        kpi(dtm_cols[1], "Pure SPXL DCA",        fmt_days(dtm_spxl),  "glass cannon",   dtm_color(dtm_spxl,   all_dtm))
+        kpi(dtm_cols[2], "Pure VOO DCA",          fmt_days(dtm_voo),   "safe but slow",  dtm_color(dtm_voo,    all_dtm))
 
         x_axis = np.linspace(0, proj_years, len(sb["spring_p50"]))
 
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p90"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p10"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.07)", line=dict(width=0), name="P10–P90"))
+                                  fillcolor="rgba(0,255,159,0.07)", line=dict(width=0), name="Strategy P10–P90"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p25"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p75"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.15)", line=dict(width=0), name="P25–P75"))
+                                  fillcolor="rgba(0,255,159,0.15)", line=dict(width=0), name="Strategy P25–P75"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p50"],
-                                  name="Tiered strategy P50", line=dict(color="#00ff9f", width=2.5)))
+                                  name="Springboard P50", line=dict(color="#00ff9f", width=2.5)))
+        fig3.add_trace(go.Scatter(x=x_axis, y=sb["spxl_p50"],
+                                  name="Pure SPXL P50", line=dict(color="#00d4ff", width=1.5, dash="dash")))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["voo_p50"],
-                                  name="VOO-only baseline", line=dict(color="#888", width=1.5, dash="dash")))
+                                  name="Pure VOO P50", line=dict(color="#888", width=1.5, dash="dot")))
+        if target_val > 0:
+            fig3.add_hline(y=target_val, line=dict(color="#f5a623", width=1, dash="dot"),
+                           annotation_text=f"${target_val/1e6:.1f}M target", annotation_position="right")
         fig3.update_layout(
-            template="plotly_dark", height=340,
+            template="plotly_dark", height=360,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -724,37 +800,31 @@ def main():
         fig3.update_yaxes(tickprefix="$")
         st.plotly_chart(fig3, use_container_width=True)
 
-        st.markdown("##### SPXL allocation % over time (median simulation path)")
+        st.markdown("##### SPXL allocation % — median simulation path")
         alloc_pct = sb["spxl_alloc_p50"] * 100
         fig_alloc = go.Figure()
         fig_alloc.add_trace(go.Scatter(
-            x=x_axis, y=alloc_pct,
-            fill="tozeroy", fillcolor="rgba(0,212,255,0.12)",
-            line=dict(color="#00d4ff", width=1.5),
+            x=x_axis, y=alloc_pct, fill="tozeroy",
+            fillcolor="rgba(0,212,255,0.12)", line=dict(color="#00d4ff", width=1.5),
         ))
         for dd, pct in tiers_input:
-            fig_alloc.add_hline(
-                y=pct, line=dict(color="#444", width=1, dash="dot"),
-                annotation_text=f"T{int(dd*100)}% → {pct}%",
-                annotation_position="right",
-            )
+            if pct > 0:
+                fig_alloc.add_hline(y=pct, line=dict(color="#333", width=1, dash="dot"),
+                    annotation_text=f"T{int(dd*100)}%→{pct}%", annotation_position="right")
         fig_alloc.update_layout(
-            template="plotly_dark", height=160,
+            template="plotly_dark", height=150,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
-            margin=dict(l=10, r=10, t=20, b=10),
+            margin=dict(l=10, r=10, t=10, b=10),
             yaxis=dict(range=[0, 105], ticksuffix="%"),
             showlegend=False,
         )
         fig_alloc.update_xaxes(title_text="Year")
         st.plotly_chart(fig_alloc, use_container_width=True)
 
-        # Real historical backtest with same tiers
+        # Real historical backtest
         st.markdown("---")
-        st.markdown("### Real historical result (2010–today) with these exact tiers")
-        if not prices.empty if "prices" in dir() else False:
-            pass
-
-        with st.spinner("Running real backtest..."):
+        st.markdown("### Real historical result (2010–today)")
+        with st.spinner("Running real backtest on actual prices..."):
             try:
                 prices_cached = load_historical()
                 if not prices_cached.empty:
@@ -763,27 +833,44 @@ def main():
                         tiers=tiers_input,
                         rebal_speed=rebal_sp,
                         initial=initial_inv,
+                        whipsaw_guard=wg,
                     )
                     rot_final    = float(rot["Strategy"].iloc[-1])
                     voo_pur_fin  = float(rot["VOO_pure"].iloc[-1])
                     spxl_pur_fin = float(rot["SPXL_pure"].iloc[-1])
                     rot_inv      = float(rot["Invested"].iloc[-1])
 
+                    # Days to target on real data
+                    dtm_r_spring = _days_to_target(rot["Strategy"].values,  target_val)
+                    dtm_r_spxl   = _days_to_target(rot["SPXL_pure"].values, target_val)
+                    dtm_r_voo    = _days_to_target(rot["VOO_pure"].values,   target_val)
+
                     rk = st.columns(4)
-                    kpi(rk[0], "Strategy final",    fmt_currency(rot_final),                         f"{rot_final/rot_inv:.2f}x invested",       "#00ff9f")
-                    kpi(rk[1], "vs pure VOO DCA",   f"{rot_final/max(voo_pur_fin,1):.2f}x",         fmt_currency(voo_pur_fin),                   "#00ffcc")
-                    kpi(rk[2], "vs pure SPXL DCA",  f"{rot_final/max(spxl_pur_fin,1):.2f}x",        fmt_currency(spxl_pur_fin),                  "#f5a623")
-                    kpi(rk[3], "Total invested",     fmt_currency(rot_inv),                           "single instrument",                         "#aaaaaa")
+                    kpi(rk[0], "Strategy final",   fmt_currency(rot_final),                          f"{rot_final/max(rot_inv,1):.2f}x invested",   "#00ff9f")
+                    kpi(rk[1], "vs pure SPXL DCA", f"{rot_final/max(spxl_pur_fin,1):.2f}x",         fmt_currency(spxl_pur_fin),                    "#00ffcc")
+                    kpi(rk[2], "vs pure VOO DCA",  f"{rot_final/max(voo_pur_fin,1):.2f}x",          fmt_currency(voo_pur_fin),                     "#aaaaaa")
+                    kpi(rk[3], "Total invested",   fmt_currency(rot_inv),                            "single stream",                               "#444")
+
+                    if any(d > 0 for d in [dtm_r_spring, dtm_r_spxl, dtm_r_voo]):
+                        st.markdown(f"**Real days to ${target_val:,.0f}:**")
+                        dc = st.columns(3)
+                        all_r = [dtm_r_spring, dtm_r_spxl, dtm_r_voo]
+                        kpi(dc[0], "Springboard",  fmt_days(dtm_r_spring), "real history", dtm_color(dtm_r_spring, all_r))
+                        kpi(dc[1], "Pure SPXL DCA",fmt_days(dtm_r_spxl),  "real history", dtm_color(dtm_r_spxl,   all_r))
+                        kpi(dc[2], "Pure VOO DCA", fmt_days(dtm_r_voo),   "real history", dtm_color(dtm_r_voo,    all_r))
 
                     fig_rot = go.Figure()
                     fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["Strategy"],
-                        name="Tiered strategy", line=dict(color="#00ff9f", width=2.5)))
+                        name="Springboard", line=dict(color="#00ff9f", width=2.5)))
                     fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["SPXL_pure"],
                         name="Pure SPXL DCA", line=dict(color="#00d4ff", width=1.5, dash="dash")))
                     fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["VOO_pure"],
                         name="Pure VOO DCA", line=dict(color="#888", width=1.5, dash="dot")))
                     fig_rot.add_trace(go.Scatter(x=rot.index, y=rot["Invested"],
                         name="Invested", line=dict(color="#333", width=1, dash="dash")))
+                    if target_val > 0:
+                        fig_rot.add_hline(y=target_val, line=dict(color="#f5a623", width=1, dash="dot"),
+                            annotation_text=f"${target_val/1e6:.1f}M", annotation_position="right")
                     fig_rot.update_layout(
                         template="plotly_dark", height=320,
                         paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
@@ -793,18 +880,15 @@ def main():
                     fig_rot.update_yaxes(tickprefix="$")
                     st.plotly_chart(fig_rot, use_container_width=True)
 
-                    st.markdown("##### SPXL allocation % — actual history")
+                    st.markdown("##### SPXL allocation % — real history")
                     fig_ra = go.Figure()
                     fig_ra.add_trace(go.Scatter(
                         x=rot.index, y=rot["SPXL_alloc"],
                         fill="tozeroy", fillcolor="rgba(0,212,255,0.12)",
                         line=dict(color="#00d4ff", width=1.2),
                     ))
-                    for dd, pct in tiers_input:
-                        fig_ra.add_hline(y=pct, line=dict(color="#444", width=1, dash="dot"),
-                                         annotation_text=f"{pct}%", annotation_position="right")
                     fig_ra.update_layout(
-                        template="plotly_dark", height=140,
+                        template="plotly_dark", height=130,
                         paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
                         margin=dict(l=10, r=10, t=10, b=10),
                         yaxis=dict(range=[0, 105], ticksuffix="%"),
@@ -812,11 +896,12 @@ def main():
                     )
                     st.plotly_chart(fig_ra, use_container_width=True)
                     st.caption(
-                        "Spikes = Mar 2020 (-34%), Q4 2018 (-20%), 2022 bear (-25%). "
-                        "Those are the coiled spring moments. Drag the tier sliders and watch the final number change."
+                        "Allocation spikes: Mar 2020 (-34%), Q4 2018 (-20%), 2022 bear (-25%). "
+                        "Each spike is followed by a Profit Lock flush back to 0% SPXL when the new ATH is hit. "
+                        "That's the cycle working exactly as designed."
                     )
                 else:
-                    st.info("Historical data unavailable — deploy to Streamlit Cloud or run locally to see real backtest here.")
+                    st.info("Historical data unavailable — run locally or on Streamlit Cloud with network access.")
             except Exception as e:
                 st.warning(f"Historical backtest skipped: {e}")
     # -------------------------------------------------------------------------
