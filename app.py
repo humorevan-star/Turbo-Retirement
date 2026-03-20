@@ -80,14 +80,26 @@ def dca_gbm_paths(years, monthly, ann_r, ann_s, expense, lev, n_paths, seed=42):
 
 @st.cache_data(ttl=86400)
 def load_historical() -> pd.DataFrame:
-    raw = yf.download(["VOO", "SPXL"], start="2010-01-01", auto_adjust=True, progress=False)
-    if isinstance(raw.columns, pd.MultiIndex):
-        field = "Close" if "Close" in raw.columns.get_level_values(0) else "Adj Close"
-        df = raw[field].copy()
-    else:
-        df = raw.copy()
-    df.columns = [str(c) for c in df.columns]
-    return df.dropna()
+    try:
+        raw = yf.download(["VOO", "SPXL"], start="2010-01-01", auto_adjust=True, progress=False)
+        if raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex):
+            # yfinance >= 0.2.x returns (field, ticker) MultiIndex
+            level0 = raw.columns.get_level_values(0).unique().tolist()
+            field = "Close" if "Close" in level0 else ("Adj Close" if "Adj Close" in level0 else level0[0])
+            df = raw[field].copy()
+        else:
+            df = raw.copy()
+        df.columns = [str(c) for c in df.columns]
+        # Ensure both tickers present
+        for col in ["VOO", "SPXL"]:
+            if col not in df.columns:
+                return pd.DataFrame()
+        df = df[["VOO", "SPXL"]].dropna()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def run_historical_dca(prices: pd.DataFrame, monthly: float) -> pd.DataFrame:
@@ -274,71 +286,80 @@ def main():
         with st.spinner("Loading historical prices from Yahoo Finance..."):
             prices = load_historical()
 
-        hist = run_historical_dca(prices, monthly_inv)
-        signals = generate_signals(prices)
+        if prices.empty:
+            st.error(
+                "Could not load historical price data from Yahoo Finance. "
+                "This can happen on Streamlit Cloud due to network restrictions or yfinance rate limits. "
+                "The **Forward Projection** and **Springboard** tabs use pure simulation and work without live data."
+            )
+        else:
+            hist = run_historical_dca(prices, monthly_inv)
+            if hist.empty or len(hist) == 0:
+                st.error("Historical DCA returned no rows — price data may be malformed. Try refreshing.")
+            else:
+                signals = generate_signals(prices)
+                voo_final = hist["VOO"].iloc[-1]
+                spxl_final = hist["SPXL"].iloc[-1]
+                invested_final = hist["Invested"].iloc[-1]
 
-        voo_final = hist["VOO"].iloc[-1]
-        spxl_final = hist["SPXL"].iloc[-1]
-        invested_final = hist["Invested"].iloc[-1]
+                k = st.columns(5)
+                kpi(k[0], "VOO Final Value", fmt_currency(voo_final), f"{voo_final/invested_final:.2f}x invested", "#00ff9f")
+                kpi(k[1], "SPXL Final Value", fmt_currency(spxl_final), f"{spxl_final/invested_final:.2f}x invested", "#00d4ff")
+                kpi(k[2], "SPXL vs VOO", f"{spxl_final/voo_final:.2f}x", "leverage edge", "#ffcc00")
+                kpi(k[3], "Total Invested", fmt_currency(invested_final), "per instrument", "#aaaaaa")
+                kpi(k[4], "Vol Drag (SPXL)", f"{vol_drag(leverage, ann_vol)*100:.2f}%/yr", "Ito annual drag", "#ff4b4b")
 
-        k = st.columns(5)
-        kpi(k[0], "VOO Final Value", fmt_currency(voo_final), f"{voo_final/invested_final:.2f}x invested", "#00ff9f")
-        kpi(k[1], "SPXL Final Value", fmt_currency(spxl_final), f"{spxl_final/invested_final:.2f}x invested", "#00d4ff")
-        kpi(k[2], "SPXL vs VOO", f"{spxl_final/voo_final:.2f}x", "leverage edge", "#ffcc00")
-        kpi(k[3], "Total Invested", fmt_currency(invested_final), "per instrument", "#aaaaaa")
-        kpi(k[4], "Vol Drag (SPXL)", f"{vol_drag(leverage, ann_vol)*100:.2f}%/yr", "Ito annual drag", "#ff4b4b")
+                st.markdown("")
 
-        st.markdown("")
+                buy_signals = signals[signals["Type"] == "BUY"]
+                sell_signals = signals[signals["Type"] == "SELL"]
 
-        buy_signals = signals[signals["Type"] == "BUY"]
-        sell_signals = signals[signals["Type"] == "SELL"]
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    row_heights=[0.65, 0.35],
+                    vertical_spacing=0.04,
+                )
 
-        fig = make_subplots(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.65, 0.35],
-            vertical_spacing=0.04,
-        )
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["VOO"], name="VOO", line=dict(color="#00ff9f", width=2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["SPXL"], name="SPXL", line=dict(color="#00d4ff", width=2)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=hist.index, y=hist["Invested"], name="Invested", line=dict(color="#555", width=1, dash="dash")), row=1, col=1)
 
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["VOO"], name="VOO", line=dict(color="#00ff9f", width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["SPXL"], name="SPXL", line=dict(color="#00d4ff", width=2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=hist.index, y=hist["Invested"], name="Invested", line=dict(color="#555", width=1, dash="dash")), row=1, col=1)
+                fig.add_trace(go.Scatter(
+                    x=hist.index, y=hist["SPXL"], name="SPXL Price", line=dict(color="#00d4ff", width=1.5)
+                ), row=2, col=1)
+                ma200 = hist["SPXL"].rolling(200, min_periods=1).mean()
+                fig.add_trace(go.Scatter(
+                    x=hist.index, y=ma200, name="MA200", line=dict(color="#f5a623", width=1, dash="dot")
+                ), row=2, col=1)
+                fig.add_trace(go.Scatter(
+                    x=buy_signals.index, y=buy_signals["Price"],
+                    mode="markers", name="BUY",
+                    marker=dict(symbol="triangle-up", size=10, color="#00ff9f")
+                ), row=2, col=1)
+                fig.add_trace(go.Scatter(
+                    x=sell_signals.index, y=sell_signals["Price"],
+                    mode="markers", name="SELL",
+                    marker=dict(symbol="triangle-down", size=10, color="#ff4b4b")
+                ), row=2, col=1)
 
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=hist["SPXL"], name="SPXL Price", line=dict(color="#00d4ff", width=1.5)
-        ), row=2, col=1)
-        ma200 = hist["SPXL"].rolling(200, min_periods=1).mean()
-        fig.add_trace(go.Scatter(
-            x=hist.index, y=ma200, name="MA200", line=dict(color="#f5a623", width=1, dash="dot")
-        ), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=buy_signals.index, y=buy_signals["Price"],
-            mode="markers", name="BUY",
-            marker=dict(symbol="triangle-up", size=10, color="#00ff9f")
-        ), row=2, col=1)
-        fig.add_trace(go.Scatter(
-            x=sell_signals.index, y=sell_signals["Price"],
-            mode="markers", name="SELL",
-            marker=dict(symbol="triangle-down", size=10, color="#ff4b4b")
-        ), row=2, col=1)
+                fig.update_layout(
+                    template="plotly_dark", height=520,
+                    paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=10, r=10, t=20, b=10),
+                )
+                fig.update_yaxes(tickprefix="$", row=1, col=1)
+                fig.update_yaxes(tickprefix="$", row=2, col=1)
+                st.plotly_chart(fig, use_container_width=True)
 
-        fig.update_layout(
-            template="plotly_dark", height=520,
-            paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=10, r=10, t=20, b=10),
-        )
-        fig.update_yaxes(tickprefix="$", row=1, col=1)
-        fig.update_yaxes(tickprefix="$", row=2, col=1)
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("### Drawdown")
-        dd_fig = go.Figure()
-        dd_fig.add_trace(go.Scatter(x=hist.index, y=compute_drawdown(hist["VOO"]), fill="tozeroy", name="VOO DD", line=dict(color="#00ff9f", width=1)))
-        dd_fig.add_trace(go.Scatter(x=hist.index, y=compute_drawdown(hist["SPXL"]), fill="tozeroy", name="SPXL DD", line=dict(color="#ff4b4b", width=1)))
-        dd_fig.update_layout(template="plotly_dark", height=200, paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14", margin=dict(l=10, r=10, t=10, b=10))
-        dd_fig.update_yaxes(ticksuffix="%")
-        st.plotly_chart(dd_fig, use_container_width=True)
+                st.markdown("### Drawdown")
+                dd_fig = go.Figure()
+                dd_fig.add_trace(go.Scatter(x=hist.index, y=compute_drawdown(hist["VOO"]), fill="tozeroy", name="VOO DD", line=dict(color="#00ff9f", width=1)))
+                dd_fig.add_trace(go.Scatter(x=hist.index, y=compute_drawdown(hist["SPXL"]), fill="tozeroy", name="SPXL DD", line=dict(color="#ff4b4b", width=1)))
+                dd_fig.update_layout(template="plotly_dark", height=200, paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14", margin=dict(l=10, r=10, t=10, b=10))
+                dd_fig.update_yaxes(ticksuffix="%")
+                st.plotly_chart(dd_fig, use_container_width=True)
 
     # -------------------------------------------------------------------------
     # TAB 2: FORWARD PROJECTION (MONTE CARLO)
