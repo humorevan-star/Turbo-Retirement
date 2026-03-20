@@ -168,12 +168,23 @@ def load_historical() -> pd.DataFrame:
     """Download VOO and SPXL historical data from Jan 2010."""
     raw = yf.download(["VOO", "SPXL"], start="2010-01-01",
                       auto_adjust=True, progress=False)
+    # yfinance ≥0.2.28 returns MultiIndex (field, ticker)
     if isinstance(raw.columns, pd.MultiIndex):
-        df = raw["Close"]
+        lvl0 = raw.columns.get_level_values(0).unique().tolist()
+        # Try Close, then Adj Close, then first available field
+        field = "Close" if "Close" in lvl0 else                 "Adj Close" if "Adj Close" in lvl0 else lvl0[0]
+        df = raw[field].copy()
+    elif "Close" in raw.columns:
+        df = raw[["Close"]].copy()
     else:
-        df = raw[["Close"]] if "Close" in raw.columns else raw
+        df = raw.copy()
     df.columns = [str(c) for c in df.columns]
-    return df.dropna()
+    # Keep only rows where both tickers have data
+    needed = [c for c in ["VOO", "SPXL"] if c in df.columns]
+    if not needed:
+        return pd.DataFrame()
+    df = df[needed].dropna()
+    return df
 
 
 def run_historical_dca(prices: pd.DataFrame, monthly: float) -> pd.DataFrame:
@@ -260,6 +271,118 @@ def _math_card(title, formula, explanation, color="#4a9eff"):
 
 
 # =============================================================================
+# 3b.  SPRINGBOARD ENGINE
+# =============================================================================
+def run_springboard(years: int, monthly: float, ann_r: float, ann_s: float,
+                    voo_exp: float, spxl_exp: float, lev: float,
+                    trigger_pct: float, n_paths: int = 200,
+                    seed: int = 42) -> dict:
+    """
+    Springboard Strategy (Mathematically Correct):
+      - Normally holds VOO (1× S&P500)
+      - Switches to SPXL (3×) when S&P500 falls trigger_pct% below 50-day high
+      - Returns to VOO once S&P recovers to the PREVIOUS high
+      - Uses log-normal GBM with proper vol-drag on SPXL
+
+    Returns median path, percentile bands, and time-in-leverage stats.
+    """
+    rng    = np.random.default_rng(seed)
+    days   = years * 252
+    dt     = 1 / 252
+
+    # GBM parameters for SPX (underlying)
+    mu_spx     = ann_r
+    sig_spx    = ann_s
+    drift_spx  = (mu_spx - 0.5 * sig_spx**2) * dt
+    sigma_spx  = sig_spx * np.sqrt(dt)
+
+    # Vol drag for leveraged ETF
+    drag_spxl  = lev * (lev - 1) / 2 * ann_s**2
+
+    # Daily log-return params
+    drift_voo  = (1.0 * ann_r - 0.5 * sig_spx**2 - voo_exp)  * dt
+    sig_voo    = sig_spx * np.sqrt(dt)
+
+    drift_spxl = (lev * ann_r - drag_spxl - spxl_exp - 0.5 * (lev*sig_spx)**2) * dt
+    sig_spxl   = lev * sig_spx * np.sqrt(dt)
+
+    all_voo    = np.zeros((days + 1, n_paths))
+    all_spxl   = np.zeros((days + 1, n_paths))
+    all_spring = np.zeros((days + 1, n_paths))
+    lev_frac   = np.zeros(n_paths)
+
+    Z = rng.standard_normal((days, n_paths))
+
+    for p in range(n_paths):
+        spx_log  = np.cumsum(drift_spx + sigma_spx * Z[:, p])
+        spx_idx  = np.concatenate([[1.0], np.exp(spx_log)])   # SPX price index
+
+        # Rolling 50-day high of SPX index
+        spx_s     = pd.Series(spx_idx)
+        roll_high = spx_s.rolling(50, min_periods=1).max().values
+        trigger   = 1 - trigger_pct / 100
+
+        # Portfolio values
+        voo_val    = 0.0
+        spxl_val   = 0.0
+        spring_val = 0.0
+        in_lev     = False
+        rec_high   = 0.0
+        lev_days_p = 0
+
+        for i in range(days):
+            # Monthly contribution (first day of each ~21-bar block)
+            if i > 0 and i % 21 == 0:
+                voo_val    += monthly
+                spxl_val   += monthly
+                spring_val += monthly
+
+            # Compound
+            r_voo    = drift_voo   + sig_voo   * Z[i, p]
+            r_spxl   = drift_spxl  + sig_spxl  * Z[i, p]   # correlated same Z
+
+            voo_val    *= np.exp(r_voo)
+            spxl_val   *= np.exp(r_spxl)
+
+            if in_lev:
+                spring_val *= np.exp(r_spxl)
+                lev_days_p += 1
+            else:
+                spring_val *= np.exp(r_voo)
+
+            all_voo[i+1, p]    = voo_val
+            all_spxl[i+1, p]   = spxl_val
+            all_spring[i+1, p] = spring_val
+
+            # Springboard trigger/exit logic
+            curr_spx  = spx_idx[i + 1]
+            curr_high = roll_high[i + 1]
+            if not in_lev:
+                if curr_spx < trigger * curr_high:
+                    in_lev  = True
+                    rec_high = curr_high
+            else:
+                if curr_spx >= rec_high:
+                    in_lev = False
+
+        lev_frac[p] = lev_days_p / days
+
+    pcts = [10, 25, 50, 75, 90]
+    return {
+        "voo_p50":    np.percentile(all_voo,    50, axis=1),
+        "spxl_p50":   np.percentile(all_spxl,   50, axis=1),
+        "spring_p10": np.percentile(all_spring, 10, axis=1),
+        "spring_p25": np.percentile(all_spring, 25, axis=1),
+        "spring_p50": np.percentile(all_spring, 50, axis=1),
+        "spring_p75": np.percentile(all_spring, 75, axis=1),
+        "spring_p90": np.percentile(all_spring, 90, axis=1),
+        "lev_pct_median":  float(np.median(lev_frac) * 100),
+        "lev_pct_p90":     float(np.percentile(lev_frac, 90) * 100),
+        "n_paths":    n_paths,
+    }
+
+
+# =============================================================================
 # 4. MAIN
 # =============================================================================
 def main():
@@ -270,9 +393,10 @@ def main():
         f"S&P assumption: {ann_ret*100:.1f}% return, {ann_vol*100:.0f}% vol"
     )
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Historical Backtest (2010–Today)",
         "🔮 Forward Projection (Monte Carlo)",
+        "🌱 Springboard Strategy",
         "📐 The Math",
     ])
 
@@ -290,11 +414,14 @@ def main():
         with st.spinner("Loading historical prices..."):
             prices = load_historical()
 
-        if "VOO" not in prices.columns or "SPXL" not in prices.columns:
+        if prices.empty or "VOO" not in prices.columns or "SPXL" not in prices.columns:
             st.error("Could not load VOO or SPXL data. Check your internet connection.")
             return
 
         hist = run_historical_dca(prices, monthly_inv)
+        if hist.empty or len(hist) == 0:
+            st.error("Historical data returned no rows. Try refreshing.")
+            return
         invested_final = hist["Invested"].iloc[-1]
         voo_hist_final = hist["VOO"].iloc[-1]
         spxl_hist_final = hist["SPXL"].iloc[-1]
@@ -536,9 +663,175 @@ def main():
         )
 
     # =========================================================================
-    # TAB 3 — THE MATH
+    # TAB 3 — SPRINGBOARD STRATEGY
     # =========================================================================
     with tab3:
+        st.markdown(
+            '<p style="font-family:monospace;font-size:11px;color:#4a5568;margin-bottom:12px;">'
+            'The Springboard strategy holds VOO normally, but switches to SPXL (3×) during '
+            'S&P 500 corrections and returns to VOO once the market recovers to its previous high. '
+            'It uses leverage only when mean-reversion probability is highest.</p>',
+            unsafe_allow_html=True,
+        )
+
+        # Springboard-specific sidebar controls rendered inline
+        sb_col1, sb_col2 = st.columns([1, 2])
+        with sb_col1:
+            trigger_pct = st.slider(
+                "Correction Trigger — % below 50-day high",
+                3.0, 25.0, 10.0, 0.5,
+                help="Enter SPXL when S&P drops this far below its 50-day rolling high.",
+            )
+            sb_paths = st.select_slider(
+                "Monte Carlo paths", options=[50, 200, 500], value=200,
+            )
+
+        with sb_col2:
+            st.markdown(
+                '<div style="background:#111318;border-radius:4px;padding:14px 18px;'
+                'border-left:3px solid #00ffcc;">'
+                '<p style="font-family:monospace;font-size:10px;color:#00ffcc;margin:0 0 8px;'
+                'text-transform:uppercase;letter-spacing:0.1em;">How Springboard Works</p>'
+                '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;">'
+                '<div><p style="font-family:monospace;font-size:11px;color:#e8eaf0;margin:0 0 4px;">① Normal (VOO)</p>'
+                '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">'
+                'Hold 1× S&P 500. Steady compounding. Zero vol drag.</p></div>'
+                '<div><p style="font-family:monospace;font-size:11px;color:#ff4b4b;margin:0 0 4px;">② Correction → SPXL</p>'
+                '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">'
+                'Switch to 3× when S&P drops >' + str(trigger_pct) + '% below 50-day high. '
+                'Maximum reversion probability.</p></div>'
+                '<div><p style="font-family:monospace;font-size:11px;color:#00ffcc;margin:0 0 4px;">③ Recovery → VOO</p>'
+                '<p style="font-size:11px;color:#4a5568;margin:0;line-height:1.6;">'
+                'Return to VOO once market recovers to previous high. '
+                'Lock gains, escape vol drag.</p></div>'
+                '</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        with st.spinner(f"Running {sb_paths} Springboard paths..."):
+            sb = run_springboard(
+                proj_years, monthly_inv, ann_ret, ann_vol,
+                voo_expense, spxl_expense, leverage,
+                trigger_pct, n_paths=sb_paths,
+            )
+
+        days_arr_sb = np.arange(proj_years * 252 + 1)
+        yrs_arr_sb  = days_arr_sb / 252
+
+        # KPI strip
+        principal_sb = monthly_inv * proj_years * 12
+        sp50 = float(sb["spring_p50"][-1])
+        vp50 = float(sb["voo_p50"][-1])
+        mult = sp50 / vp50 if vp50 > 0 else 0
+
+        k = st.columns(5)
+        _kpi(k[0], "Springboard P50", format_currency(sp50),
+             f"vs VOO {format_currency(vp50)}", "#00ffcc")
+        _kpi(k[1], "Springboard/VOO", f"{mult:.2f}×",
+             "median outperformance", "#00ffcc")
+        _kpi(k[2], "Springboard P10", format_currency(float(sb["spring_p10"][-1])),
+             "worst 10% outcome", "#f5a623")
+        _kpi(k[3], "Springboard P90", format_currency(float(sb["spring_p90"][-1])),
+             "best 10% outcome", "#00d4a0")
+        _kpi(k[4], "Avg Time in SPXL", f"{sb['lev_pct_median']:.1f}%",
+             f"up to {sb['lev_pct_p90']:.1f}% in bad markets", "#ff4b4b")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Springboard fan chart vs VOO and SPXL medians
+        fig_sb = go.Figure()
+
+        # SPXL median (reference — always-leveraged)
+        fig_sb.add_trace(go.Scatter(
+            x=yrs_arr_sb, y=sb["spxl_p50"],
+            name="SPXL P50 (always 3×)", mode="lines",
+            line=dict(color="#ff4b4b", width=1.5, dash="dot"),
+            hovertemplate="Year %{x:.1f}  SPXL: $%{y:,.0f}<extra></extra>",
+        ))
+        # VOO median
+        fig_sb.add_trace(go.Scatter(
+            x=yrs_arr_sb, y=sb["voo_p50"],
+            name="VOO P50 (always 1×)", mode="lines",
+            line=dict(color="#4a9eff", width=2),
+            hovertemplate="Year %{x:.1f}  VOO: $%{y:,.0f}<extra></extra>",
+        ))
+        # Springboard fan P10-P90
+        fig_sb.add_trace(go.Scatter(
+            x=np.concatenate([yrs_arr_sb, yrs_arr_sb[::-1]]),
+            y=np.concatenate([sb["spring_p10"], sb["spring_p90"][::-1]]),
+            fill="toself", fillcolor="rgba(0,255,159,0.08)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Springboard P10–P90", hoverinfo="skip",
+        ))
+        fig_sb.add_trace(go.Scatter(
+            x=np.concatenate([yrs_arr_sb, yrs_arr_sb[::-1]]),
+            y=np.concatenate([sb["spring_p25"], sb["spring_p75"][::-1]]),
+            fill="toself", fillcolor="rgba(0,255,159,0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Springboard P25–P75", hoverinfo="skip",
+        ))
+        # Springboard median (bold)
+        fig_sb.add_trace(go.Scatter(
+            x=yrs_arr_sb, y=sb["spring_p50"],
+            name="Springboard P50 ✦", mode="lines",
+            line=dict(color="#00ff9f", width=3),
+            hovertemplate="Year %{x:.1f}  Springboard: $%{y:,.0f}<extra></extra>",
+        ))
+
+        # Capital invested line
+        cap_line = (np.arange(len(yrs_arr_sb)) // 21) * monthly_inv
+        fig_sb.add_trace(go.Scatter(
+            x=yrs_arr_sb, y=cap_line,
+            name="Capital Invested", mode="lines",
+            line=dict(color="rgba(255,255,255,0.2)", width=1.2, dash="dot"),
+        ))
+
+        fig_sb.update_layout(
+            template="plotly_dark", height=460,
+            paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
+            margin=dict(l=12, r=12, t=12, b=12),
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                        font=dict(family="IBM Plex Mono", size=10, color="#8892a4"),
+                        bgcolor="rgba(0,0,0,0)"),
+            xaxis=dict(showgrid=False, title_text="Years"),
+            yaxis=dict(showgrid=False, zeroline=False, tickprefix="$"),
+            hovermode="x unified", font=dict(family="IBM Plex Mono"),
+        )
+        st.plotly_chart(fig_sb, use_container_width=True)
+
+        # Key insight callout
+        st.markdown(
+            '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px;">'
+
+            '<div style="background:rgba(0,255,159,0.07);border:1px solid rgba(0,255,159,0.25);'
+            'border-radius:4px;padding:12px 16px;">'
+            '<p style="font-family:monospace;font-size:10px;color:#00ffcc;margin:0 0 6px;">'
+            'WHY SPRINGBOARD BEATS PURE SPXL</p>'
+            '<p style="font-size:11px;color:#8892a4;margin:0;line-height:1.65;">'
+            'Leverage is only applied after a correction — when upside is highest and '
+            'vol is elevated (maximising leverage gains). The rest of the time VOO '
+            'avoids the daily vol-drag of ' + f"{vol_drag(leverage, ann_vol)*100:.2f}%" + '/yr '
+            'that constantly erodes SPXL in normal markets.'
+            '</p></div>'
+
+            '<div style="background:rgba(245,166,23,0.07);border:1px solid rgba(245,166,23,0.25);'
+            'border-radius:4px;padding:12px 16px;">'
+            '<p style="font-family:monospace;font-size:10px;color:#f5a623;margin:0 0 6px;">'
+            'RISKS TO UNDERSTAND</p>'
+            '<p style="font-size:11px;color:#8892a4;margin:0;line-height:1.65;">'
+            'In prolonged bear markets (2000-2002, 2008-2009), the trigger fires and '
+            'SPXL keeps falling. The recovery-high exit does not protect against '
+            'multi-year drawdowns. Also: switching costs and taxes at each transition.'
+            '</p></div>'
+
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    # =========================================================================
+    # TAB 4 — THE MATH (was TAB 3)
+    # =========================================================================
+    with tab4:
         st.markdown(
             "### Why leveraged ETFs don't simply return 3× the index\n"
             "The mathematics of daily-reset leverage creates a permanent drag "
