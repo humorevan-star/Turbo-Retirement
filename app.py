@@ -716,7 +716,7 @@ def main():
         for dd_pct in [0, 10, 20, 30, 40]:
             spxl_v   = _tier_spxl(dd_pct / 100, tiers_input)
             voo_v    = 100 - spxl_v
-            port_bounce_10 = spxl_v / 100 * lev * 10 + voo_v / 100 * 10
+            port_bounce_10 = spxl_v / 100 * leverage * 10 + voo_v / 100 * 10
             preview_rows.append({
                 "Drop from 50d high": f"-{dd_pct}%",
                 "SPXL": f"{spxl_v:.0f}%",
