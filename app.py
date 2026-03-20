@@ -171,135 +171,131 @@ def kpi(col, label, val, sub=None, color="#e8eaf0"):
 
 
 # =============================================================================
-# SPRINGBOARD ENGINE — Dynamic Drawdown Loader
+# SPRINGBOARD ENGINE — Simple $90 SPXL / $10 VOO DCA + Drawdown Rebalancer
 # =============================================================================
-# Core idea:
-#   BELOW MA200 (drawdown mode):
-#     SPXL alloc ramps linearly from spxl_base → 100% as drawdown deepens to dd_max
-#     e.g. at -0% below MA200 = spxl_base (e.g. 100%), at -dd_max = 100% SPXL
-#   ABOVE MA200 (recovery mode):
-#     Gradually shift toward voo_cruise / spxl_cruise as price climbs above MA200
-#     Shift speed controlled by recovery_speed (0=instant, 1=very slow)
+# Rules:
+#   Every month: invest spxl_monthly into SPXL, voo_monthly into VOO (base DCA)
+#   Additionally: track VOO's drawdown from its all-time-high (ATH)
+#     - Linear shift: at dd_pct% below ATH, move shift_pct% of VOO portfolio → SPXL
+#     - At max_dd% below ATH → 100% of VOO portfolio value is in SPXL
+#     - As VOO recovers back toward ATH, reverse the shift proportionally
+#   Monthly contribution redirect: same linear ratio applied to the $10 VOO DCA
+#     e.g. at -20% drawdown → redirect 50% of that month's VOO $ into SPXL instead
 # =============================================================================
-def _alloc_below_ma(drawdown_pct, spxl_base, dd_max):
-    """Linear ramp: at dd=0 → spxl_base, at dd>=dd_max → 1.0 SPXL"""
-    t = min(abs(drawdown_pct) / dd_max, 1.0)
-    spxl = spxl_base + t * (1.0 - spxl_base)
-    return float(np.clip(spxl, 0.0, 1.0))
 
-
-def _alloc_above_ma(price, ma, spxl_cruise, recovery_bands):
+def _drawdown_shift_pct(drawdown: float, max_dd: float) -> float:
     """
-    Tiered gradual shift above MA200.
-    recovery_bands: list of (pct_above_ma, spxl_target) sorted ascending.
-    Interpolates between bands.
+    How much of the VOO portfolio to shift into SPXL.
+    drawdown: positive fraction (e.g. 0.20 = 20% below ATH)
+    Returns fraction 0.0 → 1.0
     """
-    pct_above = (price - ma) / ma  # positive number
-    # find which band we are in
-    if pct_above <= 0:
-        return 1.0  # right at MA, still heavy SPXL
-    for i, (band_pct, spxl_target) in enumerate(recovery_bands):
-        if pct_above <= band_pct:
-            # interpolate from previous band
-            prev_pct, prev_spxl = recovery_bands[i - 1] if i > 0 else (0.0, 1.0)
-            t = (pct_above - prev_pct) / (band_pct - prev_pct + 1e-9)
-            return float(np.clip(prev_spxl + t * (spxl_target - prev_spxl), spxl_cruise, 1.0))
-    return float(spxl_cruise)
+    return float(np.clip(drawdown / max_dd, 0.0, 1.0))
 
 
 def run_springboard(
-    years, monthly, ann_r, ann_s,
+    years, monthly,          # total monthly DCA
+    ann_r, ann_s,
     voo_exp, spxl_exp, lev,
-    spxl_base=1.0,        # SPXL alloc at exactly MA200 (normal bull market)
-    spxl_cruise=0.05,     # SPXL alloc when well above MA200 (min floor)
-    dd_max=0.20,          # drawdown depth at which SPXL hits 100%
+    spxl_monthly_pct=0.90,   # base split: 90% of monthly → SPXL
+    max_dd=0.40,             # drawdown at which 100% of VOO value shifts to SPXL
     n_paths=200, seed=42,
 ):
     """
-    Recovery bands: price 0-5% above MA200 → gradual shift from 100% to ~50% SPXL
-                    price 5-15% above MA200 → shift from ~50% to spxl_cruise
-                    price >15% above MA200  → hold at spxl_cruise
+    spxl_monthly_pct: fraction of monthly DCA that always goes to SPXL (default 0.90)
+    voo_monthly_pct:  remainder always goes to VOO (default 0.10)
+    On top of that, drawdown rebalancer shifts VOO portfolio value to SPXL linearly.
     """
-    recovery_bands = [
-        (0.05, 0.70),   # 5% above MA  → 70% SPXL
-        (0.10, 0.30),   # 10% above MA → 30% SPXL
-        (0.15, spxl_cruise),  # 15%+ above MA → cruise allocation
-    ]
-
     rng = np.random.default_rng(seed)
-    days = years * 252
-    dt = 1 / 252
+    days  = years * 252
+    dt    = 1 / 252
 
-    drag_spxl = vol_drag(lev, ann_s)
-    drift_spx = (ann_r - 0.5 * ann_s ** 2) * dt
-    sigma_spx = ann_s * np.sqrt(dt)
-    drift_voo = (ann_r - voo_exp - 0.5 * ann_s ** 2) * dt
-    sig_voo = ann_s * np.sqrt(dt)
-    drift_spxl = (lev * ann_r - drag_spxl - spxl_exp - 0.5 * (lev * ann_s) ** 2) * dt
-    sig_spxl = lev * ann_s * np.sqrt(dt)
+    voo_monthly  = monthly * (1.0 - spxl_monthly_pct)
+    spxl_monthly = monthly * spxl_monthly_pct
 
-    all_voo = np.zeros((days + 1, n_paths))
-    all_spring = np.zeros((days + 1, n_paths))
-    spxl_alloc_history = np.zeros((days + 1, n_paths))
-    lev_frac = np.zeros(n_paths)
+    drag_spxl   = vol_drag(lev, ann_s)
+    drift_voo   = (ann_r - voo_exp  - 0.5 * ann_s**2)          * dt
+    sig_voo     = ann_s * np.sqrt(dt)
+    drift_spxl  = (lev*ann_r - drag_spxl - spxl_exp - 0.5*(lev*ann_s)**2) * dt
+    sig_spxl    = lev * ann_s * np.sqrt(dt)
+
+    # also need a "reference VOO price" for ATH tracking — use a clean GBM index
+    drift_spx   = (ann_r - 0.5 * ann_s**2) * dt
+    sig_spx     = ann_s * np.sqrt(dt)
+
+    all_spring       = np.zeros((days + 1, n_paths))
+    all_voo_baseline = np.zeros((days + 1, n_paths))
+    all_spxl_alloc   = np.zeros((days + 1, n_paths))   # fraction in SPXL each day
+    shifted_frac     = np.zeros(n_paths)
 
     Z = rng.standard_normal((days, n_paths))
 
     for p in range(n_paths):
-        spx = np.concatenate([[1.0], np.exp(np.cumsum(drift_spx + sigma_spx * Z[:, p]))])
-        spx_s = pd.Series(spx)
-        ma200 = spx_s.rolling(200, min_periods=1).mean().values
-        rolling_peak = spx_s.rolling(200, min_periods=1).max().values
+        # --- portfolio buckets ---
+        voo_bucket  = 0.0   # VOO portion (shrinks when we shift to SPXL)
+        spxl_bucket = 0.0   # SPXL portion (grows from base DCA + shifted value)
+        voo_base    = 0.0   # pure VOO baseline (no shifting) for comparison
 
-        voo_val = spring_val = 0.0
-        lev_days_p = 0
+        voo_ath     = 1.0   # track ATH of VOO price index
+        voo_price   = 1.0   # synthetic VOO price index
+
+        total_shifted_days = 0
 
         for i in range(days):
+            # ── monthly contributions ──────────────────────────────────────
             if i > 0 and i % 21 == 0:
-                voo_val += monthly
-                spring_val += monthly
+                # current drawdown
+                dd = max(0.0, (voo_ath - voo_price) / voo_ath)
+                shift = _drawdown_shift_pct(dd, max_dd)
 
-            r_voo = drift_voo + sig_voo * Z[i, p]
+                # base DCA: spxl_monthly always goes to SPXL
+                spxl_bucket += spxl_monthly
+                voo_base    += voo_monthly
+
+                # VOO DCA redirect: shift fraction of voo_monthly → SPXL
+                spxl_bucket += voo_monthly * shift
+                voo_bucket  += voo_monthly * (1.0 - shift)
+
+                # portfolio rebalance: move shift% of current voo_bucket → spxl_bucket
+                # (only rebalance the delta from last month's shift level)
+                rebal_amount = voo_bucket * shift
+                spxl_bucket += rebal_amount
+                voo_bucket  -= rebal_amount
+
+            # ── daily returns ──────────────────────────────────────────────
+            r_voo  = drift_voo  + sig_voo  * Z[i, p]
             r_spxl = drift_spxl + sig_spxl * Z[i, p]
+            r_spx  = drift_spx  + sig_spx  * Z[i, p]
 
-            voo_val = max(voo_val * np.exp(r_voo), 0)
+            voo_bucket   = max(voo_bucket  * np.exp(r_voo),  0.0)
+            spxl_bucket  = max(spxl_bucket * np.exp(r_spxl), 0.0)
+            voo_base     = max(voo_base    * np.exp(r_voo),  0.0)
 
-            curr = spx[i + 1]
-            ma = ma200[i + 1]
-            peak = rolling_peak[i + 1]
+            # update VOO price index + ATH
+            voo_price *= np.exp(r_spx)
+            voo_ath    = max(voo_ath, voo_price)
 
-            if curr <= ma:
-                # Drawdown mode: compute drawdown from rolling peak
-                dd_from_peak = (curr - peak) / peak   # negative number
-                spxl_w = _alloc_below_ma(dd_from_peak, spxl_base, dd_max)
-            else:
-                # Recovery mode: gradual VOO shift as price rises above MA
-                spxl_w = _alloc_above_ma(curr, ma, spxl_cruise, recovery_bands)
+            total_val = voo_bucket + spxl_bucket
+            spxl_frac = spxl_bucket / total_val if total_val > 0 else spxl_monthly_pct
 
-            voo_w = 1.0 - spxl_w
-            spring_val = max(spring_val * np.exp(r_spxl * spxl_w + r_voo * voo_w), 0)
-            spxl_alloc_history[i + 1, p] = spxl_w
+            all_spring[i+1, p]       = total_val
+            all_voo_baseline[i+1, p] = voo_base
+            all_spxl_alloc[i+1, p]   = spxl_frac
 
-            if spxl_w > 0.5:
-                lev_days_p += 1
+            if spxl_frac > spxl_monthly_pct:
+                total_shifted_days += 1
 
-            all_voo[i + 1, p] = voo_val
-            all_spring[i + 1, p] = spring_val
-
-        lev_frac[p] = lev_days_p / days
+        shifted_frac[p] = total_shifted_days / days
 
     return {
-        "voo_p50":        np.percentile(all_voo, 50, axis=1),
+        "voo_p50":        np.percentile(all_voo_baseline, 50, axis=1),
         "spring_p10":     np.percentile(all_spring, 10, axis=1),
         "spring_p25":     np.percentile(all_spring, 25, axis=1),
         "spring_p50":     np.percentile(all_spring, 50, axis=1),
         "spring_p75":     np.percentile(all_spring, 75, axis=1),
         "spring_p90":     np.percentile(all_spring, 90, axis=1),
-        "spxl_alloc_p50": np.percentile(spxl_alloc_history, 50, axis=1),
-        "lev_pct_median": float(np.median(lev_frac) * 100),
+        "spxl_alloc_p50": np.percentile(all_spxl_alloc, 50, axis=1),
+        "shifted_pct":    float(np.median(shifted_frac) * 100),
     }
-
-
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -439,34 +435,41 @@ def main():
         st.plotly_chart(fig2, use_container_width=True)
 
     # -------------------------------------------------------------------------
-    # TAB 3: SPRINGBOARD — Dynamic Drawdown Loader
+    # TAB 3: SPRINGBOARD — $90 SPXL / $10 VOO + Drawdown Rebalancer
     # -------------------------------------------------------------------------
     with tab3:
         st.markdown(
-            "**Dynamic Drawdown Loader** — loads heavier into SPXL as markets fall, "
-            "gradually rotates back to VOO as they recover. No manual signals needed."
+            "**Base DCA:** $90/month SPXL · $10/month VOO — always. "
+            "**Drawdown rebalancer:** as VOO drops from its ATH, portfolio value + monthly contributions "
+            "shift linearly from VOO → SPXL. Fully reverses as VOO recovers."
         )
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.markdown("##### Drawdown loading")
-            spxl_base = st.slider(
-                "SPXL % at MA200 (normal market)", 50, 100, 100, 5,
-                help="Allocation to SPXL when price is exactly at MA200.",
-            ) / 100
-            dd_max_pct = st.slider(
-                "Drawdown depth → 100% SPXL (%)", 5, 40, 20, 5,
-                help="How far below the rolling peak before allocation reaches 100% SPXL.",
-            ) / 100
-        with c2:
-            st.markdown("##### Recovery rotation")
-            spxl_cruise = st.slider(
-                "Min SPXL % when well above MA200", 0, 30, 5, 5,
-                help="Floor SPXL allocation once price is >15% above MA200. The rest is VOO.",
-            ) / 100
-            st.caption(
-                f"Rotation: 100% SPXL → 70% @ +5% → 30% @ +10% → {spxl_cruise*100:.0f}% @ +15%"
+            st.markdown("##### Base DCA split")
+            spxl_pct = st.slider(
+                "SPXL % of monthly DCA", 50, 100, 90, 5,
+                help="Default: 90% SPXL / 10% VOO every month regardless of market conditions."
             )
+            voo_pct = 100 - spxl_pct
+            st.caption(f"→ SPXL ${monthly_inv * spxl_pct / 100:.0f} · VOO ${monthly_inv * voo_pct / 100:.0f} per month")
+
+        with c2:
+            st.markdown("##### Drawdown trigger levels")
+            st.caption("Linear shift: VOO portfolio value moves to SPXL as price falls from ATH")
+            max_dd_pct = st.slider(
+                "Drawdown at 100% shift (%)", 20, 60, 40, 5,
+                help="At this drawdown from ATH, 100% of VOO bucket value moves to SPXL."
+            )
+            # Show the linear table
+            levels = [10, 20, 30, max_dd_pct]
+            rows = ""
+            for d in sorted(set(levels)):
+                shift = min(d / max_dd_pct * 100, 100)
+                spxl_eff = spxl_pct + (100 - spxl_pct) * (shift / 100)
+                rows += "| -{}% | {:.0f}% VOO shifted | ~{:.0f}% SPXL |\n".format(d, shift, spxl_eff)
+            st.markdown("| Drop from ATH | VOO shift | Effective SPXL |\n|---|---|---|\n" + rows)
+
         with c3:
             st.markdown("##### Simulation")
             sb_paths = st.select_slider("Monte Carlo paths", options=[100, 200, 300, 500], value=200)
@@ -475,41 +478,40 @@ def main():
             sb = run_springboard(
                 proj_years, monthly_inv, ann_ret, ann_vol,
                 voo_expense, spxl_expense, leverage,
-                spxl_base=spxl_base,
-                spxl_cruise=spxl_cruise,
-                dd_max=dd_max_pct,
+                spxl_monthly_pct=spxl_pct / 100,
+                max_dd=max_dd_pct / 100,
                 n_paths=sb_paths,
             )
 
-        sp50 = float(sb["spring_p50"][-1])
-        vp50 = float(sb["voo_p50"][-1])
-        total_inv = monthly_inv * (proj_years * 252 // 21)
-        cagr_sb  = (sp50 / max(total_inv, 1)) ** (1 / max(proj_years, 1)) - 1
-        cagr_voo = (vp50 / max(total_inv, 1)) ** (1 / max(proj_years, 1)) - 1
+        sp50     = float(sb["spring_p50"][-1])
+        vp50     = float(sb["voo_p50"][-1])
+        total_inv_sb = monthly_inv * (proj_years * 252 // 21)
+        cagr_sb  = (sp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
+        cagr_voo = (vp50 / max(total_inv_sb, 1)) ** (1 / max(proj_years, 1)) - 1
 
         k = st.columns(5)
-        kpi(k[0], "Springboard P50",  fmt_currency(sp50),                         "median final value",       "#00ff9f")
-        kpi(k[1], "Est. CAGR",        f"{cagr_sb*100:.1f}%",                       f"vs VOO {cagr_voo*100:.1f}%", "#00ffcc")
-        kpi(k[2], "P10 Downside",     fmt_currency(float(sb["spring_p10"][-1])),   "worst 10%",                "#f5a623")
-        kpi(k[3], "P90 Upside",       fmt_currency(float(sb["spring_p90"][-1])),   "best 10%",                 "#00d4a0")
-        kpi(k[4], "Time >50% SPXL",   f"{sb['lev_pct_median']:.0f}%",             "of trading days",          "#ff4b4b")
+        kpi(k[0], "Springboard P50",   fmt_currency(sp50),                          "median final value",          "#00ff9f")
+        kpi(k[1], "Est. CAGR",         f"{cagr_sb*100:.1f}%",                        f"vs VOO-only {cagr_voo*100:.1f}%", "#00ffcc")
+        kpi(k[2], "P10 Downside",      fmt_currency(float(sb["spring_p10"][-1])),    "worst 10%",                   "#f5a623")
+        kpi(k[3], "P90 Upside",        fmt_currency(float(sb["spring_p90"][-1])),    "best 10%",                    "#00d4a0")
+        kpi(k[4], "Days shifted >base",f"{sb['shifted_pct']:.0f}%",                  "extra SPXL vs base split",    "#ff4b4b")
 
         x_axis = np.linspace(0, proj_years, len(sb["spring_p50"]))
 
-        # Main fan chart
+        # Fan chart
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p90"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p10"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.10)", line=dict(width=0), name="P10–P90 range"))
+                                  fillcolor="rgba(0,255,159,0.08)", line=dict(width=0), name="P10–P90"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p25"], fill=None, line=dict(width=0), showlegend=False))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p75"], fill="tonexty",
-                                  fillcolor="rgba(0,255,159,0.18)", line=dict(width=0), name="P25–P75 range"))
+                                  fillcolor="rgba(0,255,159,0.15)", line=dict(width=0), name="P25–P75"))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["spring_p50"],
                                   name="Springboard P50", line=dict(color="#00ff9f", width=2.5)))
         fig3.add_trace(go.Scatter(x=x_axis, y=sb["voo_p50"],
-                                  name="VOO baseline", line=dict(color="#888", width=1.5, dash="dash")))
+                                  name="VOO-only baseline", line=dict(color="#888", width=1.5, dash="dash")))
         fig3.update_layout(
-            template="plotly_dark", height=380,
+            template="plotly_dark", height=360,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -518,22 +520,21 @@ def main():
         fig3.update_yaxes(tickprefix="$")
         st.plotly_chart(fig3, use_container_width=True)
 
-        # SPXL allocation over time (median path)
-        st.markdown("##### Median SPXL allocation over time")
+        # SPXL allocation over time
+        st.markdown("##### SPXL allocation % over time (median path)")
         alloc_pct = sb["spxl_alloc_p50"] * 100
         fig_alloc = go.Figure()
         fig_alloc.add_trace(go.Scatter(
             x=x_axis, y=alloc_pct,
-            fill="tozeroy", fillcolor="rgba(0,212,255,0.15)",
+            fill="tozeroy", fillcolor="rgba(0,212,255,0.12)",
             line=dict(color="#00d4ff", width=1.5),
-            name="SPXL alloc %",
         ))
-        fig_alloc.add_hline(y=spxl_cruise * 100, line=dict(color="#888", width=1, dash="dot"),
-                            annotation_text=f"cruise {spxl_cruise*100:.0f}%", annotation_position="right")
+        fig_alloc.add_hline(y=spxl_pct, line=dict(color="#00ff9f", width=1, dash="dot"),
+                            annotation_text=f"base {spxl_pct}%", annotation_position="right")
         fig_alloc.add_hline(y=100, line=dict(color="#ff4b4b", width=1, dash="dot"),
                             annotation_text="100% SPXL", annotation_position="right")
         fig_alloc.update_layout(
-            template="plotly_dark", height=180,
+            template="plotly_dark", height=160,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
             margin=dict(l=10, r=10, t=10, b=10),
             yaxis=dict(range=[0, 105], ticksuffix="%"),
@@ -543,11 +544,10 @@ def main():
         st.plotly_chart(fig_alloc, use_container_width=True)
 
         st.caption(
-            "Strategy: below MA200 → SPXL ramps linearly to 100% as drawdown deepens. "
-            "Above MA200 → gradual rotation to VOO as price climbs (+5% / +10% / +15% bands). "
-            "Max CAGR tip: keep SPXL @ MA200 at 100% and cruise floor at 5%."
+            f"During drawdowns the green SPXL allocation line spikes upward — "
+            f"that's the rebalancer loading heavy for the recovery. "
+            f"It gradually returns to the {spxl_pct}% base as VOO reclaims its ATH."
         )
-
     # -------------------------------------------------------------------------
     # TAB 4: THE MATH
     # -------------------------------------------------------------------------
