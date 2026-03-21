@@ -1085,7 +1085,7 @@ def main():
 
         ctrl1, ctrl2, ctrl3 = st.columns(3)
         with ctrl1:
-            sb_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
+            sb_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200, key="l_paths")
             rebal_sp  = st.slider("Rebal speed %/month", 10, 60, 30, 10,
                 help="% of allocation gap closed each month.") / 100
         with ctrl2:
@@ -1375,7 +1375,7 @@ if not core_signal → switch to VOO
         lc1, lc2, lc3 = st.columns(3)
         with lc1:
             st.markdown("##### Portfolio split")
-            voo_core_s = st.slider("VOO core %", 50, 95, 80, 5,
+            voo_core_s = st.slider("VOO core %", 50, 95, 80, 5, key="l_voo_core",
                 help="Permanent VOO allocation. The LEAPS buffer is the remainder.")
             leaps_pct_s = 100 - voo_core_s
             st.caption(f"VOO core: {voo_core_s}% · LEAPS buffer: {leaps_pct_s}%")
@@ -1384,20 +1384,20 @@ if not core_signal → switch to VOO
 
         with lc2:
             st.markdown("##### LEAPS parameters")
-            trigger_s    = st.slider("Entry trigger (% below ATH)", 5, 25, 10, 1,
+            trigger_s    = st.slider("Entry trigger (% below ATH)", 5, 25, 10, 1, key="l_trigger",
                 help="Deploy LEAPS buffer when market drops this far from its ATH.") / 100
-            delta_s      = st.slider("Target delta", 75, 95, 88, 1,
+            delta_s      = st.slider("Target delta", 75, 95, 88, 1, key="l_delta",
                 help="0.85-0.90 = deep ITM. Higher delta = less theta, more intrinsic.") / 100
-            tenor_s      = st.slider("LEAPS tenor (years)", 1.0, 2.5, 1.75, 0.25,
+            tenor_s      = st.slider("LEAPS tenor (years)", 1.0, 2.5, 1.75, 0.25, key="l_tenor",
                 help="Time to expiry when purchasing. 1.5-2yr is the sweet spot.")
-            theta_s      = st.slider("Theta drag (%/month)", 0.2, 1.0, 0.5, 0.1,
+            theta_s      = st.slider("Theta drag (%/month)", 0.2, 1.0, 0.5, 0.1, key="l_theta",
                 help="Monthly option decay cost while active. Deep ITM = low theta.") / 100
 
         with lc3:
             st.markdown("##### Roll & simulation")
-            roll_mo_s    = st.slider("Roll every N months", 6, 12, 9, 1,
+            roll_mo_s    = st.slider("Roll every N months", 6, 12, 9, 1, key="l_roll_mo",
                 help="Roll to next 2-year contract every N months. ~1% cost per roll.")
-            roll_cost_s  = st.slider("Roll cost %", 0.5, 2.0, 1.0, 0.1) / 100
+            roll_cost_s  = st.slider("Roll cost %", 0.5, 2.0, 1.0, 0.1, key="l_roll_cost") / 100
             leaps_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
 
         with st.spinner(f"Running {leaps_paths} LEAPS paths..."):
