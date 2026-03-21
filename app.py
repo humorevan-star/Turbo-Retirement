@@ -508,202 +508,161 @@ def run_ath_rotation_backtest(
         "SPXL_pure":  np.round(out_spxl_pure, 2),
     }, index=dates)
 # =============================================================================
-# OMEGA LEAPS HYBRID ENGINE
+# OMEGA LEAPS — Pure LEAPS DCA (no VOO core)
 # =============================================================================
-# Model: Black-Scholes deep-ITM call approximation
-#   delta ≈ 0.85-0.90  →  effective leverage ≈ delta * (S/C) where C = option price
-#   theta drag ≈ 0.4-0.6%/month of contract value (only while active)
-#   roll cost ≈ 1% every 9 months
+# Every dollar goes into deep-ITM calls.
+# When no active position: cash sits in MMF at risk_free rate.
+# Entry: deploy 100% of cash buffer into LEAPS when trigger fires.
+# Exit (Profit Lock): sell all LEAPS → back to MMF when new ATH hit.
+# Roll: every roll_months, extend to next 2-year cycle (~1% cost).
+# Monthly DCA: goes into MMF immediately, deployed on next entry signal.
 #
-# Portfolio:
-#   VOO core  → permanent, compounds at VOO rate always
-#   LEAPS buffer → sits in cash (4% MMF) when inactive
-#                  converts to deep-ITM calls when trigger fires (-10% from 50d high)
-#                  exits when new 50d-high broken (profit lock)
+# LEAPS daily P&L model:
+#   dV = V * (delta * r_idx - theta_daily)
+#   where theta_daily = theta_mo / 21
 #
-# LEAPS call pricing (simplified Black-Scholes deep ITM):
-#   C ≈ S*delta - K*e^{-r*T} + small_extrinsic
-#   effective leverage = delta * S / C
+# Effective leverage = delta * S / C  (Black-Scholes deep ITM)
+# At delta=0.875, 15% ITM strike: effective leverage ≈ 3.5-5x on cash deployed
 # =============================================================================
 
-def _bs_call_price(S, K, T, r, sigma, delta_target=0.875):
-    """
-    Approximate deep-ITM call price via Black-Scholes.
-    Returns (price, delta, effective_leverage).
-    T in years, r risk-free rate.
-    """
-    from scipy.stats import norm
-    if T <= 0 or sigma <= 0:
-        intrinsic = max(S - K, 0)
-        return intrinsic, 1.0, S / max(intrinsic, 1)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    call_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    delta = norm.cdf(d1)
-    eff_lev = delta * S / max(call_price, 0.01)
-    return max(call_price, S - K + 0.01), delta, eff_lev
+def _bs_call_price(S, K, T, r, sigma):
+    """Black-Scholes call price, delta, effective leverage."""
+    try:
+        from scipy.stats import norm
+        if T <= 0 or sigma <= 0:
+            intrinsic = max(S - K, 0.01)
+            return intrinsic, min((S - K) / S + 0.05, 0.99), S / max(S - K, 0.01)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        price  = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        delta  = float(norm.cdf(d1))
+        eff_lev= delta * S / max(price, 0.01)
+        return max(price, S - K + 0.001), delta, eff_lev
+    except Exception:
+        intrinsic = max(S - K, S * 0.10)
+        delta = 0.875
+        return intrinsic, delta, delta * S / intrinsic
 
 
 def run_leaps_hybrid(
     years, monthly,
     ann_r, ann_s,
-    voo_exp,
-    voo_core_pct   = 0.80,   # fraction of portfolio kept in VOO always
-    leaps_pct      = 0.20,   # fraction of portfolio as LEAPS buffer
-    trigger_dd     = 0.10,   # deploy LEAPS at -10% from 50d high
-    delta_target   = 0.875,  # 0.85-0.90 deep ITM
-    leaps_tenor    = 1.75,   # years to expiry (≈630 days, 2-year cycle)
-    roll_months    = 9,      # roll every N months
-    roll_cost_pct  = 0.01,   # 1% roll cost per roll event
-    theta_mo_pct   = 0.005,  # 0.5%/month theta drag while active
-    risk_free      = 0.04,   # MMF rate on idle buffer
+    voo_exp,                   # kept for API compat, not used
+    voo_core_pct   = 0.0,      # ignored — pure LEAPS
+    leaps_pct      = 1.0,      # ignored — 100% always
+    trigger_dd     = 0.10,
+    delta_target   = 0.875,
+    leaps_tenor    = 1.75,
+    roll_months    = 9,
+    roll_cost_pct  = 0.01,
+    theta_mo_pct   = 0.005,
+    risk_free      = 0.04,
     n_paths        = 200,
     seed           = 42,
     initial        = 0,
 ):
-    try:
-        from scipy.stats import norm
-        HAS_SCIPY = True
-    except ImportError:
-        HAS_SCIPY = False
-
     rng  = np.random.default_rng(seed)
     days = years * 252
     dt   = 1 / 252
 
-    drift_voo = (ann_r - voo_exp - 0.5 * ann_s**2) * dt
-    sig_voo   = ann_s * np.sqrt(dt)
-    drift_idx = (ann_r - 0.5 * ann_s**2) * dt
-    sig_idx   = ann_s * np.sqrt(dt)
+    drift_idx  = (ann_r - 0.5 * ann_s**2) * dt
+    sig_idx    = ann_s * np.sqrt(dt)
+    drift_voo  = (ann_r - voo_exp - 0.5 * ann_s**2) * dt
+    sig_voo    = ann_s * np.sqrt(dt)
 
-    all_hybrid    = np.zeros((days+1, n_paths))
-    all_voo_base  = np.zeros((days+1, n_paths))
-    all_spxl_base = np.zeros((days+1, n_paths))
-    all_leaps_act = np.zeros((days+1, n_paths))  # 1 = LEAPS active
+    # pure SPXL benchmark
+    drag_spxl  = vol_drag(3.0, ann_s)
+    drift_spxl = (3.0*ann_r - drag_spxl - 0.0091 - 0.5*(3.0*ann_s)**2) * dt
+    sig_spxl   = 3.0 * ann_s * np.sqrt(dt)
 
-    # also run pure SPXL for comparison (Ito-correct)
-    drag_spxl   = vol_drag(3.0, ann_s)
-    drift_spxl  = (3.0*ann_r - drag_spxl - 0.0091 - 0.5*(3.0*ann_s)**2)*dt
-    sig_spxl    = 3.0 * ann_s * np.sqrt(dt)
+    all_leaps  = np.zeros((days+1, n_paths))
+    all_voo    = np.zeros((days+1, n_paths))
+    all_spxl   = np.zeros((days+1, n_paths))
+    all_active = np.zeros((days+1, n_paths))
 
     Z = rng.standard_normal((days, n_paths))
 
     for p in range(n_paths):
-        # portfolio split
-        start_val   = max(initial, 0.0)
-        voo_b       = start_val * voo_core_pct
-        leaps_cash  = start_val * leaps_pct   # idle buffer in MMF
-        leaps_val   = 0.0                      # current LEAPS mark-to-market
+        cash        = float(initial)   # MMF cash buffer
+        leaps_val   = 0.0              # mark-to-market of open position
         leaps_active= False
-        leaps_entry_idx  = 0.0  # index level when LEAPS entered
-        leaps_strike     = 0.0
-        leaps_t_remaining= 0.0
-        months_since_roll= 0
-
-        voo_base  = start_val
-        spxl_base = start_val
-
-        idx = 1.0; idx_ath = 1.0
+        leaps_delta = delta_target
         days_since_entry = 999
 
+        # pure benchmarks
+        voo_b   = float(initial)
+        spxl_b  = float(initial)
+
+        idx = 1.0; idx_ath = 1.0
+
         for i in range(days):
-            r_voo  = drift_voo + sig_voo  * Z[i, p]
-            r_spxl = drift_spxl + sig_spxl * Z[i, p]
             r_idx  = drift_idx  + sig_idx  * Z[i, p]
+            r_voo  = drift_voo  + sig_voo  * Z[i, p]
+            r_spxl = drift_spxl + sig_spxl * Z[i, p]
 
-            # grow core VOO
-            voo_b    = max(voo_b    * np.exp(r_voo), 0.0)
-            voo_base = max(voo_base * np.exp(r_voo), 0.0)
-            spxl_base= max(spxl_base* np.exp(r_spxl),0.0)
+            # benchmarks compound daily
+            voo_b  = max(voo_b  * np.exp(r_voo),  0.0)
+            spxl_b = max(spxl_b * np.exp(r_spxl), 0.0)
 
-            # grow idle cash at risk-free
-            if not leaps_active:
-                leaps_cash *= np.exp(risk_free * dt)
+            # LEAPS P&L
+            if leaps_active:
+                theta_d = theta_mo_pct / 21.0
+                leaps_val = max(leaps_val * (np.exp(leaps_delta * r_idx) - theta_d), 0.0)
+            else:
+                # idle cash earns MMF
+                cash *= np.exp(risk_free * dt)
 
-            idx *= np.exp(r_idx)
+            idx    *= np.exp(r_idx)
             idx_ath = max(idx_ath, idx)
 
-            lo_day = max(0, i - 49)
-            # approximate 50d high using idx_ath rolling — simplification
-            h50 = idx_ath   # use ATH as proxy (conservative trigger)
-            dd  = max(0.0, (h50 - idx) / h50)
+            dd     = max(0.0, (idx_ath - idx) / idx_ath)
             at_ath = idx >= idx_ath * 0.999
-
             days_since_entry += 1
 
-            # ── PROFIT LOCK: new ATH → sell LEAPS → back to cash ──────────
+            # ── PROFIT LOCK ───────────────────────────────────────────────
             if leaps_active and at_ath and days_since_entry > 10:
-                leaps_cash += leaps_val
-                leaps_val   = 0.0
-                leaps_active= False
+                cash        += leaps_val
+                leaps_val    = 0.0
+                leaps_active = False
 
-            # ── ROLL: every roll_months while active ──────────────────────
+            # ── ROLL ──────────────────────────────────────────────────────
             if leaps_active and i > 0 and i % (roll_months * 21) == 0:
-                leaps_val *= (1 - roll_cost_pct)  # roll cost
-                leaps_t_remaining = leaps_tenor    # reset tenor
-                months_since_roll = 0
+                leaps_val *= (1.0 - roll_cost_pct)
 
-            # ── ENTRY: trigger on dd ≥ trigger_dd ──────────────────────────
-            if not leaps_active and dd >= trigger_dd and leaps_cash > 0:
-                # price the contract at entry
-                S = idx; K = idx * (1 - 0.15)  # 15% ITM strike
-                T = leaps_tenor; r = risk_free
-                if HAS_SCIPY:
-                    call_p, delta, eff_lev = _bs_call_price(S, K, T, r, ann_s, delta_target)
-                else:
-                    # fallback: intrinsic + 5% extrinsic
-                    intrinsic = S - K
-                    call_p = intrinsic * 1.05
-                    delta  = 0.875
-                    eff_lev= delta * S / max(call_p, 0.01)
-
-                leaps_val        = leaps_cash  # deploy all buffer
-                leaps_cash       = 0.0
+            # ── ENTRY ─────────────────────────────────────────────────────
+            if not leaps_active and dd >= trigger_dd and cash > 0:
+                S = idx; K = idx * (1.0 - 0.15); T = leaps_tenor
+                _, leaps_delta, eff_lev = _bs_call_price(S, K, T, risk_free, ann_s)
+                leaps_val        = cash
+                cash             = 0.0
                 leaps_active     = True
-                leaps_entry_idx  = idx
-                leaps_strike     = K
-                leaps_t_remaining= T
-                leaps_delta      = delta
-                leaps_eff_lev    = eff_lev
                 days_since_entry = 0
-                months_since_roll= 0
-
-            # ── LEAPS DAILY P&L: delta * index_return - theta ────────────
-            if leaps_active:
-                idx_ret = r_idx  # daily log return of index
-                # option value change: delta * dS - theta_daily
-                theta_daily = theta_mo_pct / 21.0
-                leaps_val = max(leaps_val * np.exp(leaps_delta * idx_ret) - leaps_val * theta_daily, 0.0)
-                leaps_t_remaining -= dt
-
-            total = voo_b + leaps_val + (leaps_cash if not leaps_active else 0.0)
 
             # ── MONTHLY DCA ───────────────────────────────────────────────
             if i > 0 and i % 21 == 0:
-                voo_b     += monthly * voo_core_pct
-                leaps_cash += monthly * leaps_pct
-                voo_base  += monthly
-                spxl_base += monthly
-                # if LEAPS active, deploy new monthly buffer immediately
-                if leaps_active and leaps_cash > 0:
-                    leaps_val  += leaps_cash
-                    leaps_cash  = 0.0
+                voo_b  += monthly
+                spxl_b += monthly
+                if leaps_active:
+                    # DCA directly into existing position
+                    leaps_val += monthly
+                else:
+                    cash += monthly
 
-            total = voo_b + leaps_val + leaps_cash
-            all_hybrid[i+1, p]    = total
-            all_voo_base[i+1, p]  = voo_base
-            all_spxl_base[i+1, p] = spxl_base
-            all_leaps_act[i+1, p] = 1.0 if leaps_active else 0.0
+            total = leaps_val + cash
+            all_leaps[i+1, p]  = total
+            all_voo[i+1, p]    = voo_b
+            all_spxl[i+1, p]   = spxl_b
+            all_active[i+1, p] = 1.0 if leaps_active else 0.0
 
     return {
-        "hybrid_p10":    np.percentile(all_hybrid,    10, axis=1),
-        "hybrid_p25":    np.percentile(all_hybrid,    25, axis=1),
-        "hybrid_p50":    np.percentile(all_hybrid,    50, axis=1),
-        "hybrid_p75":    np.percentile(all_hybrid,    75, axis=1),
-        "hybrid_p90":    np.percentile(all_hybrid,    90, axis=1),
-        "voo_p50":       np.percentile(all_voo_base,  50, axis=1),
-        "spxl_p50":      np.percentile(all_spxl_base, 50, axis=1),
-        "leaps_active":  np.mean(all_leaps_act,           axis=1),
+        "hybrid_p10":   np.percentile(all_leaps, 10, axis=1),
+        "hybrid_p25":   np.percentile(all_leaps, 25, axis=1),
+        "hybrid_p50":   np.percentile(all_leaps, 50, axis=1),
+        "hybrid_p75":   np.percentile(all_leaps, 75, axis=1),
+        "hybrid_p90":   np.percentile(all_leaps, 90, axis=1),
+        "voo_p50":      np.percentile(all_voo,   50, axis=1),
+        "spxl_p50":     np.percentile(all_spxl,  50, axis=1),
+        "leaps_active": np.mean(all_active,           axis=1),
     }
 
 
@@ -711,8 +670,8 @@ def run_leaps_historical(
     prices: pd.DataFrame,
     monthly: float,
     initial: float       = 0,
-    voo_core_pct: float  = 0.80,
-    leaps_pct: float     = 0.20,
+    voo_core_pct: float  = 0.0,   # ignored
+    leaps_pct: float     = 1.0,   # ignored
     trigger_dd: float    = 0.10,
     delta_target: float  = 0.875,
     leaps_tenor: float   = 1.75,
@@ -721,35 +680,26 @@ def run_leaps_historical(
     theta_mo_pct: float  = 0.005,
     risk_free: float     = 0.04,
 ) -> pd.DataFrame:
-    """Historical LEAPS hybrid backtest on real VOO prices."""
-    try:
-        from scipy.stats import norm
-        HAS_SCIPY = True
-    except ImportError:
-        HAS_SCIPY = False
-
+    """Pure LEAPS DCA historical backtest on real VOO prices."""
     voo_prices  = prices["VOO"].values
     spxl_prices = prices["SPXL"].values
     dates       = prices.index
     n           = len(dates)
 
-    # estimate realised vol from first 60 days
     log_rets_init = np.diff(np.log(np.maximum(voo_prices[:61], 1e-6)))
     hist_vol = float(np.std(log_rets_init) * np.sqrt(252)) if len(log_rets_init) > 5 else 0.18
 
-    voo_b         = initial * voo_core_pct
-    leaps_cash    = initial * leaps_pct
-    leaps_val     = 0.0
-    leaps_active  = False
-    leaps_delta   = delta_target
+    cash         = float(initial)
+    leaps_val    = 0.0
+    leaps_active = False
+    leaps_delta  = delta_target
     days_since_entry = 999
-    months_since_roll= 0
 
     voo_ath = None; lm = -1; invested = initial
-    voo_shares_pure  = 0.0 if initial == 0 else initial / max(voo_prices[0], 1)
-    spxl_shares_pure = 0.0 if initial == 0 else initial / max(spxl_prices[0], 1)
+    voo_shares_pure  = (initial / max(voo_prices[0], 1)) if initial > 0 else 0.0
+    spxl_shares_pure = (initial / max(spxl_prices[0], 1)) if initial > 0 else 0.0
 
-    out_hybrid   = np.zeros(n)
+    out_leaps    = np.zeros(n)
     out_alloc    = np.zeros(n)
     out_invested = np.zeros(n)
     out_voo_pure = np.zeros(n)
@@ -759,81 +709,72 @@ def run_leaps_historical(
     for i, date in enumerate(dates):
         vp = voo_prices[i]; sp = spxl_prices[i]
         if vp <= 0 or sp <= 0:
-            out_hybrid[i]   = voo_b + leaps_val + leaps_cash
+            out_leaps[i]    = leaps_val + cash
             out_invested[i] = invested
             continue
 
-        # daily compounding
-        if i > 0:
-            pv = voo_prices[i-1]
-            if pv > 0:
-                voo_ret = vp / pv
-                voo_b  *= voo_ret
-                if leaps_active:
-                    idx_ret = np.log(voo_ret)
-                    theta_d = theta_mo_pct / 21.0
-                    leaps_val = max(leaps_val * np.exp(leaps_delta * idx_ret) - leaps_val * theta_d, 0.0)
-                else:
-                    leaps_cash *= np.exp(risk_free / 252)
+        # daily P&L
+        if i > 0 and voo_prices[i-1] > 0:
+            r_idx = np.log(vp / voo_prices[i-1])
+            if leaps_active:
+                theta_d   = theta_mo_pct / 21.0
+                leaps_val = max(leaps_val * (np.exp(leaps_delta * r_idx) - theta_d), 0.0)
+            else:
+                cash *= np.exp(risk_free / 252)
 
-        voo_ath = max(voo_ath, vp) if voo_ath else vp
-        dd = max(0.0, (voo_ath - vp) / voo_ath)
-        at_ath = vp >= voo_ath * 0.999
+        voo_ath      = max(voo_ath, vp) if voo_ath else vp
+        dd           = max(0.0, (voo_ath - vp) / voo_ath)
+        at_ath       = vp >= voo_ath * 0.999
         days_since_entry += 1
 
         # PROFIT LOCK
         if leaps_active and at_ath and days_since_entry > 10:
-            leaps_cash  += leaps_val
+            cash        += leaps_val
             leaps_val    = 0.0
             leaps_active = False
 
-        # ROLL every roll_months
-        if leaps_active and i > 0 and (i % (roll_months * 21) == 0):
-            leaps_val       *= (1 - roll_cost_pct)
-            months_since_roll = 0
+        # ROLL
+        if leaps_active and i > 0 and i % (roll_months * 21) == 0:
+            leaps_val *= (1.0 - roll_cost_pct)
 
         # ENTRY
-        if not leaps_active and dd >= trigger_dd and leaps_cash > 0:
-            S = vp; K = vp * 0.85; T = leaps_tenor
-            if HAS_SCIPY:
-                call_p, leaps_delta, _ = _bs_call_price(S, K, T, risk_free, hist_vol, delta_target)
-            else:
+        if not leaps_active and dd >= trigger_dd and cash > 0:
+            try:
+                _, leaps_delta, _ = _bs_call_price(vp, vp * 0.85, leaps_tenor, risk_free, hist_vol)
+            except Exception:
                 leaps_delta = delta_target
-            leaps_val        = leaps_cash
-            leaps_cash       = 0.0
+            leaps_val        = cash
+            cash             = 0.0
             leaps_active     = True
             days_since_entry = 0
-            months_since_roll= 0
 
         # MONTHLY DCA
         if date.month != lm:
-            voo_b     += monthly * voo_core_pct
-            leaps_cash += monthly * leaps_pct
-            invested  += monthly
+            invested += monthly
             if vp > 0: voo_shares_pure  += monthly / vp
             if sp > 0: spxl_shares_pure += monthly / sp
-            if leaps_active and leaps_cash > 0:
-                leaps_val  += leaps_cash
-                leaps_cash  = 0.0
+            if leaps_active:
+                leaps_val += monthly
+            else:
+                cash += monthly
             lm = date.month
 
-        total = voo_b + leaps_val + leaps_cash
-        out_hybrid[i]    = total
-        out_alloc[i]     = leaps_val / max(total, 1)
-        out_invested[i]  = invested
-        out_voo_pure[i]  = voo_shares_pure * vp
-        out_spxl_pure[i] = spxl_shares_pure * sp
-        out_active[i]    = 1.0 if leaps_active else 0.0
+        total = leaps_val + cash
+        out_leaps[i]    = total
+        out_alloc[i]    = leaps_val / max(total, 1)
+        out_invested[i] = invested
+        out_voo_pure[i] = voo_shares_pure * vp
+        out_spxl_pure[i]= spxl_shares_pure * sp
+        out_active[i]   = 1.0 if leaps_active else 0.0
 
     return pd.DataFrame({
-        "Strategy":    np.round(out_hybrid,    2),
+        "Strategy":    np.round(out_leaps,     2),
         "LEAPS_alloc": np.round(out_alloc * 100, 1),
         "LEAPS_active":out_active,
         "Invested":    np.round(out_invested,  2),
         "VOO_pure":    np.round(out_voo_pure,  2),
         "SPXL_pure":   np.round(out_spxl_pure, 2),
     }, index=dates)
-
 
 # =============================================================================
 # MAIN
@@ -1363,54 +1304,57 @@ if not core_signal → switch to VOO
 
 
     # -------------------------------------------------------------------------
-    # TAB 5: OMEGA LEAPS HYBRID
+    # TAB 5: OMEGA LEAPS — Pure Deep-ITM Calls, No VOO
     # -------------------------------------------------------------------------
     with tab5:
         st.markdown(
-            "**Omega LEAPS Hybrid** — VOO core + deep-ITM LEAPS calls deployed only during dips. "
-            "Zero volatility decay. Theta drag only while active (~25-35% of time). "
-            "Roll every 9 months. Profit Lock on new ATH."
+            "**Omega LEAPS — Pure Deep-ITM Calls.** "
+            "100% of capital deployed into deep-ITM SPY/SPLG calls at every entry signal. "
+            "Cash earns MMF yield (~4%) when not deployed. "
+            "**Profit Lock:** sell everything on new ATH → back to MMF. Roll every 9 months."
         )
 
         lc1, lc2, lc3 = st.columns(3)
         with lc1:
-            st.markdown("##### Portfolio split")
-            voo_core_s = st.slider("VOO core %", 50, 95, 80, 5, key="l_voo_core",
-                help="Permanent VOO allocation. The LEAPS buffer is the remainder.")
-            leaps_pct_s = 100 - voo_core_s
-            st.caption(f"VOO core: {voo_core_s}% · LEAPS buffer: {leaps_pct_s}%")
-            if initial_inv > 0:
-                st.caption(f"Day-1: ${initial_inv * voo_core_s/100:,.0f} VOO + ${initial_inv * leaps_pct_s/100:,.0f} LEAPS buffer")
+            st.markdown("##### Entry & exit")
+            trigger_s = st.slider("Entry trigger (% below ATH)", 5, 25, 10, 1, key="l_trigger",
+                help="Deploy 100% of cash into LEAPS when market drops this far from ATH.")
+            delta_s   = st.slider("Target delta", 75, 95, 88, 1, key="l_delta",
+                help="0.85-0.90 = deep ITM. Higher = less theta, more intrinsic.") / 100
+            tenor_s   = st.slider("LEAPS tenor (years)", 1.0, 2.5, 1.75, 0.25, key="l_tenor",
+                help="Time to expiry on purchase. 1.5-2yr is standard.")
 
         with lc2:
-            st.markdown("##### LEAPS parameters")
-            trigger_s    = st.slider("Entry trigger (% below ATH)", 5, 25, 10, 1, key="l_trigger",
-                help="Deploy LEAPS buffer when market drops this far from its ATH.") / 100
-            delta_s      = st.slider("Target delta", 75, 95, 88, 1, key="l_delta",
-                help="0.85-0.90 = deep ITM. Higher delta = less theta, more intrinsic.") / 100
-            tenor_s      = st.slider("LEAPS tenor (years)", 1.0, 2.5, 1.75, 0.25, key="l_tenor",
-                help="Time to expiry when purchasing. 1.5-2yr is the sweet spot.")
-            theta_s      = st.slider("Theta drag (%/month)", 0.2, 1.0, 0.5, 0.1, key="l_theta",
-                help="Monthly option decay cost while active. Deep ITM = low theta.") / 100
+            st.markdown("##### Cost model")
+            theta_s    = st.slider("Theta drag (%/month)", 0.2, 1.0, 0.5, 0.1, key="l_theta",
+                help="Monthly decay cost while active. Deep ITM keeps this very low.") / 100
+            roll_mo_s  = st.slider("Roll every N months", 6, 12, 9, 1, key="l_roll_mo",
+                help="Extend to next 2-year cycle every N months. ~1% transaction cost.")
+            roll_cost_s= st.slider("Roll cost %", 0.5, 2.0, 1.0, 0.1, key="l_roll_cost") / 100
+            mmf_rate   = st.slider("MMF yield % (idle cash)", 2.0, 6.0, 4.0, 0.5, key="l_mmf",
+                help="What your cash earns while waiting for the next entry signal.") / 100
 
         with lc3:
-            st.markdown("##### Roll & simulation")
-            roll_mo_s    = st.slider("Roll every N months", 6, 12, 9, 1, key="l_roll_mo",
-                help="Roll to next 2-year contract every N months. ~1% cost per roll.")
-            roll_cost_s  = st.slider("Roll cost %", 0.5, 2.0, 1.0, 0.1, key="l_roll_cost") / 100
-            leaps_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200)
+            st.markdown("##### Simulation")
+            leaps_paths = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200, key="l_paths")
+            st.markdown("")
+            st.markdown("**How it works:**")
+            st.caption(f"1. Cash sits in MMF at {mmf_rate*100:.1f}%/yr")
+            st.caption(f"2. At -{trigger_s}% from ATH → 100% into δ={delta_s:.2f} LEAPS")
+            st.caption(f"3. Daily P&L: δ × index return − {theta_s*100:.2f}%/day theta")
+            st.caption(f"4. New ATH hit → sell all → back to MMF")
+            st.caption(f"5. Roll every {roll_mo_s}mo at {roll_cost_s*100:.1f}% cost")
 
-        with st.spinner(f"Running {leaps_paths} LEAPS paths..."):
+        with st.spinner(f"Running {leaps_paths} pure LEAPS paths..."):
             lb = run_leaps_hybrid(
                 proj_years, monthly_inv, ann_ret, ann_vol, voo_expense,
-                voo_core_pct  = voo_core_s / 100,
-                leaps_pct     = leaps_pct_s / 100,
                 trigger_dd    = trigger_s,
                 delta_target  = delta_s,
                 leaps_tenor   = tenor_s,
                 roll_months   = roll_mo_s,
                 roll_cost_pct = roll_cost_s,
                 theta_mo_pct  = theta_s,
+                risk_free     = mmf_rate,
                 n_paths       = leaps_paths,
                 initial       = initial_inv,
             )
@@ -1418,45 +1362,55 @@ if not core_signal → switch to VOO
         lp50  = float(lb["hybrid_p50"][-1])
         vp50l = float(lb["voo_p50"][-1])
         xp50l = float(lb["spxl_p50"][-1])
-        total_inv_l = initial_inv + monthly_inv * (proj_years * 252 // 21)
-        cagr_l    = (lp50 / max(total_inv_l, 1)) ** (1 / max(proj_years, 1)) - 1
+        total_inv_l   = initial_inv + monthly_inv * (proj_years * 252 // 21)
+        cagr_l    = (lp50  / max(total_inv_l, 1)) ** (1 / max(proj_years, 1)) - 1
         cagr_vool = (vp50l / max(total_inv_l, 1)) ** (1 / max(proj_years, 1)) - 1
         cagr_xl   = (xp50l / max(total_inv_l, 1)) ** (1 / max(proj_years, 1)) - 1
         leaps_pct_time = float(np.mean(lb["leaps_active"]) * 100)
 
-        # Days to target
-        target_l = 1_000_000
-        dtm_l  = _days_to_target(lb["hybrid_p50"], target_l)
-        dtm_lx = _days_to_target(lb["spxl_p50"],  target_l)
-        dtm_lv = _days_to_target(lb["voo_p50"],   target_l)
-        def fmt_days(d):
-            if d < 0: return "not reached"
-            return f"{d/252:.1f} yrs"
+        dtm_l  = _days_to_target(lb["hybrid_p50"], 1_000_000)
+        dtm_lx = _days_to_target(lb["spxl_p50"],   1_000_000)
+        dtm_lv = _days_to_target(lb["voo_p50"],    1_000_000)
+
+        def fmt_d(d):
+            return "not reached" if d < 0 else f"{d/252:.1f} yrs"
+
+        def dtm_col(d, others):
+            valid = [x for x in others if x > 0]
+            if d < 0: return "#f5a623"
+            return "#ff9f00" if (valid and d == min(valid)) else "#aaaaaa"
 
         k = st.columns(5)
-        kpi(k[0], "LEAPS Hybrid P50", fmt_currency(lp50),          f"CAGR {cagr_l*100:.1f}%",      "#ff9f00")
-        kpi(k[1], "vs Pure SPXL",     f"{lp50/max(xp50l,1):.2f}x", f"{cagr_xl*100:.1f}% CAGR SPXL","#00d4ff")
-        kpi(k[2], "vs Pure VOO",      f"{lp50/max(vp50l,1):.2f}x", f"{cagr_vool*100:.1f}% CAGR VOO","#888")
-        kpi(k[3], "LEAPS active",     f"{leaps_pct_time:.0f}%",     "of trading days",              "#ff4b4b")
-        kpi(k[4], "Days to $1M",      fmt_days(dtm_l),              f"SPXL {fmt_days(dtm_lx)}",     "#ff9f00")
+        kpi(k[0], "Pure LEAPS P50",   fmt_currency(lp50),           f"CAGR {cagr_l*100:.1f}%",         "#ff9f00")
+        kpi(k[1], "vs Pure SPXL",     f"{lp50/max(xp50l,1):.2f}x", f"SPXL {cagr_xl*100:.1f}% CAGR",   "#00d4ff")
+        kpi(k[2], "vs Pure VOO",      f"{lp50/max(vp50l,1):.2f}x", f"VOO {cagr_vool*100:.1f}% CAGR",   "#888")
+        kpi(k[3], "LEAPS active",     f"{leaps_pct_time:.0f}%",     "of trading days",                  "#ff4b4b")
+        kpi(k[4], "Days to $1M",      fmt_d(dtm_l),                 f"SPXL: {fmt_d(dtm_lx)}",           dtm_col(dtm_l,[dtm_l,dtm_lx,dtm_lv]))
+
+        # Days to $1M comparison strip
+        dc = st.columns(3)
+        all_dtm = [dtm_l, dtm_lx, dtm_lv]
+        kpi(dc[0], "LEAPS $1M",    fmt_d(dtm_l),  "pure LEAPS",   dtm_col(dtm_l,  all_dtm))
+        kpi(dc[1], "SPXL $1M",     fmt_d(dtm_lx), "pure SPXL",    dtm_col(dtm_lx, all_dtm))
+        kpi(dc[2], "VOO $1M",      fmt_d(dtm_lv), "pure VOO",     dtm_col(dtm_lv, all_dtm))
 
         x_axis_l = np.linspace(0, proj_years, len(lb["hybrid_p50"]))
 
         fig_l = go.Figure()
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["hybrid_p90"], fill=None, line=dict(width=0), showlegend=False))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["hybrid_p10"], fill="tonexty",
-                                   fillcolor="rgba(255,159,0,0.08)", line=dict(width=0), name="P10-P90"))
+            fillcolor="rgba(255,159,0,0.07)", line=dict(width=0), name="P10-P90"))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["hybrid_p25"], fill=None, line=dict(width=0), showlegend=False))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["hybrid_p75"], fill="tonexty",
-                                   fillcolor="rgba(255,159,0,0.15)", line=dict(width=0), name="P25-P75"))
+            fillcolor="rgba(255,159,0,0.15)", line=dict(width=0), name="P25-P75"))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["hybrid_p50"],
-                                   name="Omega LEAPS P50", line=dict(color="#ff9f00", width=2.5)))
+            name="Pure LEAPS P50", line=dict(color="#ff9f00", width=2.5)))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["spxl_p50"],
-                                   name="Pure SPXL P50", line=dict(color="#00d4ff", width=1.5, dash="dash")))
+            name="Pure SPXL P50", line=dict(color="#00d4ff", width=1.5, dash="dash")))
         fig_l.add_trace(go.Scatter(x=x_axis_l, y=lb["voo_p50"],
-                                   name="Pure VOO P50", line=dict(color="#888", width=1.5, dash="dot")))
+            name="Pure VOO P50", line=dict(color="#888", width=1.5, dash="dot")))
         fig_l.add_hline(y=1_000_000, line=dict(color="#f5a623", width=1, dash="dot"),
-                        annotation_text="$1M", annotation_position="right")
+            annotation_text="$1M", annotation_position="right")
         fig_l.update_layout(
             template="plotly_dark", height=380,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
@@ -1467,18 +1421,17 @@ if not core_signal → switch to VOO
         fig_l.update_yaxes(tickprefix="$")
         st.plotly_chart(fig_l, use_container_width=True)
 
-        # LEAPS active % over time
-        st.markdown("##### LEAPS active % (fraction of paths in-position each day)")
+        st.markdown("##### LEAPS active % over time (fraction of paths in-position)")
         fig_la = go.Figure()
         fig_la.add_trace(go.Scatter(
             x=x_axis_l, y=lb["leaps_active"] * 100,
             fill="tozeroy", fillcolor="rgba(255,159,0,0.15)",
             line=dict(color="#ff9f00", width=1.5),
         ))
-        fig_la.add_hline(y=100*trigger_s, line=dict(color="#444", width=1, dash="dot"),
-                         annotation_text=f"trigger {trigger_s*100:.0f}% dip", annotation_position="right")
+        fig_la.add_hline(y=trigger_s, line=dict(color="#444", width=1, dash="dot"),
+            annotation_text=f"entry at -{trigger_s}%", annotation_position="right")
         fig_la.update_layout(
-            template="plotly_dark", height=140,
+            template="plotly_dark", height=130,
             paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
             margin=dict(l=10, r=10, t=10, b=10),
             yaxis=dict(range=[0, 105], ticksuffix="%"),
@@ -1490,55 +1443,54 @@ if not core_signal → switch to VOO
         # Real historical backtest
         st.markdown("---")
         st.markdown("### Real historical LEAPS backtest (2010–today)")
-        with st.spinner("Running LEAPS on real prices..."):
+        with st.spinner("Running pure LEAPS on real prices..."):
             try:
                 prices_l = load_historical()
                 if not prices_l.empty:
                     lh = run_leaps_historical(
                         prices_l, monthly_inv,
                         initial       = initial_inv,
-                        voo_core_pct  = voo_core_s / 100,
-                        leaps_pct     = leaps_pct_s / 100,
                         trigger_dd    = trigger_s,
                         delta_target  = delta_s,
                         leaps_tenor   = tenor_s,
                         roll_months   = roll_mo_s,
                         roll_cost_pct = roll_cost_s,
                         theta_mo_pct  = theta_s,
+                        risk_free     = mmf_rate,
                     )
                     lh_final    = float(lh["Strategy"].iloc[-1])
                     voo_lh_fin  = float(lh["VOO_pure"].iloc[-1])
                     spxl_lh_fin = float(lh["SPXL_pure"].iloc[-1])
                     lh_inv      = float(lh["Invested"].iloc[-1])
-                    leaps_pct_hist = float(lh["LEAPS_active"].mean() * 100)
+                    leaps_active_hist = float(lh["LEAPS_active"].mean() * 100)
 
                     rk = st.columns(4)
-                    kpi(rk[0], "LEAPS Hybrid final",  fmt_currency(lh_final),                        f"{lh_final/max(lh_inv,1):.2f}x invested",  "#ff9f00")
-                    kpi(rk[1], "vs pure SPXL DCA",    f"{lh_final/max(spxl_lh_fin,1):.2f}x",        fmt_currency(spxl_lh_fin),                  "#00d4ff")
-                    kpi(rk[2], "vs pure VOO DCA",     f"{lh_final/max(voo_lh_fin,1):.2f}x",         fmt_currency(voo_lh_fin),                   "#888")
-                    kpi(rk[3], "LEAPS active (hist)",  f"{leaps_pct_hist:.0f}%",                     "of real trading days",                     "#ff4b4b")
+                    kpi(rk[0], "LEAPS final",       fmt_currency(lh_final),                        f"{lh_final/max(lh_inv,1):.2f}x invested",  "#ff9f00")
+                    kpi(rk[1], "vs pure SPXL DCA",  f"{lh_final/max(spxl_lh_fin,1):.2f}x",        fmt_currency(spxl_lh_fin),                  "#00d4ff")
+                    kpi(rk[2], "vs pure VOO DCA",   f"{lh_final/max(voo_lh_fin,1):.2f}x",         fmt_currency(voo_lh_fin),                   "#888")
+                    kpi(rk[3], "LEAPS active hist", f"{leaps_active_hist:.0f}%",                   "of real trading days",                     "#ff4b4b")
 
                     fig_lh = go.Figure()
                     fig_lh.add_trace(go.Scatter(x=lh.index, y=lh["Strategy"],
-                        name="Omega LEAPS Hybrid", line=dict(color="#ff9f00", width=2.5)))
+                        name="Pure LEAPS", line=dict(color="#ff9f00", width=2.5)))
                     fig_lh.add_trace(go.Scatter(x=lh.index, y=lh["SPXL_pure"],
                         name="Pure SPXL DCA", line=dict(color="#00d4ff", width=1.5, dash="dash")))
                     fig_lh.add_trace(go.Scatter(x=lh.index, y=lh["VOO_pure"],
                         name="Pure VOO DCA", line=dict(color="#888", width=1.5, dash="dot")))
                     fig_lh.add_trace(go.Scatter(x=lh.index, y=lh["Invested"],
                         name="Invested", line=dict(color="#333", width=1, dash="dash")))
-                    # shade LEAPS active periods
+                    # shade active LEAPS periods
                     active = lh["LEAPS_active"].values
-                    in_active = False; shade_start = None
-                    for idx_d, date in enumerate(lh.index):
-                        if active[idx_d] and not in_active:
-                            shade_start = date; in_active = True
-                        elif not active[idx_d] and in_active:
-                            fig_lh.add_vrect(x0=shade_start, x1=date,
-                                fillcolor="rgba(255,159,0,0.08)", line_width=0)
-                            in_active = False
+                    in_a = False; t0 = None
+                    for ii, dt_ in enumerate(lh.index):
+                        if active[ii] and not in_a:
+                            t0 = dt_; in_a = True
+                        elif not active[ii] and in_a:
+                            fig_lh.add_vrect(x0=t0, x1=dt_,
+                                fillcolor="rgba(255,159,0,0.09)", line_width=0)
+                            in_a = False
                     fig_lh.update_layout(
-                        template="plotly_dark", height=340,
+                        template="plotly_dark", height=320,
                         paper_bgcolor="#0b0e14", plot_bgcolor="#0b0e14",
                         margin=dict(l=10, r=10, t=10, b=10),
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -1546,35 +1498,40 @@ if not core_signal → switch to VOO
                     fig_lh.update_yaxes(tickprefix="$")
                     st.plotly_chart(fig_lh, use_container_width=True)
                     st.caption(
-                        "Orange shaded regions = LEAPS active. Each spike = a crash entry (2018, 2020, 2022). "
-                        "Each fade-out = profit lock on ATH. No vol decay ever."
+                        "Orange shaded = LEAPS deployed. "
+                        "Cash earns MMF yield between deployments. "
+                        "Each profit lock returns everything to cash on the new ATH."
                     )
                 else:
-                    st.info("Historical prices unavailable on this host. Forward projection above is fully functional.")
+                    st.info("Historical prices unavailable. Forward projection above is fully functional.")
             except Exception as e:
                 st.warning(f"Historical LEAPS backtest skipped: {e}")
 
         st.markdown("---")
-        st.markdown("### vs SPXL: the decay math")
+        st.markdown("### The decay math: why LEAPS beats SPXL in crashes")
         mc1, mc2 = st.columns(2)
         with mc1:
             drag_ann = vol_drag(3.0, ann_vol)
-            st.markdown("**SPXL annual vol drag (Ito)**")
+            st.markdown("**SPXL vol drag** (paid every single day, bull or bear)")
             st.latex(r"	ext{Drag} = rac{L(L-1)}{2}\sigma^2")
-            st.markdown(f"= {drag_ann*100:.2f}%/yr at σ={ann_vol*100:.0f}%")
-            st.markdown("**LEAPS theta drag (active only)**")
-            st.latex(r"	ext{Theta} pprox 0.5\%/	ext{month} 	imes 30\% 	ext{ active} = 1.8\%/	ext{yr effective}")
-            st.markdown(f"At {leaps_pct_time:.0f}% active: **{theta_s*100:.1f}%/mo × {leaps_pct_time:.0f}% = {theta_s*leaps_pct_time/100*12:.2f}%/yr effective drag**")
+            st.markdown(f"= **{drag_ann*100:.2f}%/yr** at σ={ann_vol*100:.0f}% — permanent, compounding")
+            st.markdown("**LEAPS theta** (paid only while deployed)")
+            eff_theta = theta_s * 12 * leaps_pct_time / 100
+            st.markdown(f"= {theta_s*100:.1f}%/mo × {leaps_pct_time:.0f}% active = **{eff_theta:.2f}%/yr effective**")
+            st.markdown(f"Theta advantage vs SPXL drag: **{(drag_ann - eff_theta)*100:.1f}%/yr saved**")
         with mc2:
-            st.markdown("**Effective leverage comparison**")
+            st.markdown("**Comparison table**")
+            eff_lev_leaps = delta_s / 0.15  # approx: delta * S/C where C ≈ 15% of S
             dd_tbl = {
-                "Instrument":    ["SPXL (daily reset)", f"LEAPS δ={delta_s:.2f}"],
-                "Leverage":      ["3.0x",               f"~{delta_s * (1/0.20):.1f}x on buffer"],
-                "Annual drag":   [f"{drag_ann*100:.1f}%", f"~{theta_s*12*leaps_pct_time/100:.1f}% eff."],
-                "Decay type":    ["Daily · compounds",  "Theta · only active"],
-                "Max drawdown":  ["~90%+",              "~52-58%"],
+                "":              ["SPXL (3x daily)",       f"Pure LEAPS δ={delta_s:.2f}"],
+                "Leverage":      ["3.0x",                  f"~{eff_lev_leaps:.1f}x on cash"],
+                "Decay (idle)":  ["Full drag always",      "MMF yield (positive!)"],
+                "Decay (active)":[ f"{drag_ann*100:.1f}%/yr", f"{theta_s*12*100:.1f}%/yr theta"],
+                "Max drawdown":  ["~90%+ (2008)",          "~60-70% (options ≥ 0)"],
+                "Wipeout risk":  ["Real",                  "None — options floor at zero"],
             }
             st.dataframe(pd.DataFrame(dd_tbl), hide_index=True, use_container_width=True)
+
 
 if __name__ == "__main__":
     main()
