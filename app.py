@@ -508,63 +508,78 @@ def run_ath_rotation_backtest(
         "SPXL_pure":  np.round(out_spxl_pure, 2),
     }, index=dates)
 # =============================================================================
-# OMEGA LEAPS — Always-On Deep-ITM Calls (no cash, no VOO)
+# OMEGA LEAPS — Capital-Efficient Deep-ITM Calls
 # =============================================================================
-# You are ALWAYS in LEAPS. 100% of capital in deep-ITM calls at all times.
-# Roll forward every roll_months to the next 2-year contract (~1% cost).
-# Profit Lock: on new ATH, sell and immediately re-enter at new strike.
-# Monthly DCA: goes directly into the current open position.
+# THE CORRECT MODEL:
 #
-# Daily P&L:
-#   position_value *= exp(delta * r_index) * (1 - theta_daily)
+#   Each month you invest `monthly` dollars to BUY deep-ITM call contracts.
+#   A deep-ITM call (δ=0.875, 15% ITM strike) costs roughly 20% of the
+#   underlying price (intrinsic + small extrinsic).
 #
-# Effective leverage at entry:
-#   delta=0.875, 15% ITM → effective lev ≈ delta * S/C ≈ 3.5-5x
+#   So $500/month buys you CONTROL over $500/0.20 = $2,500 of SPY notional.
+#   That is 5x capital leverage at entry.
 #
-# Why this beats SPXL:
-#   SPXL vol drag = L(L-1)/2 * σ² ≈ 4.9%/yr (paid every day, compounding)
-#   LEAPS theta   ≈ 0.5%/month = 6%/yr MAX — but only on the option premium,
-#   not the full notional. On deep ITM, premium ≈ 15% of S, so effective
-#   theta drag on notional ≈ 6% × 15% ≈ 0.9%/yr. Far less than SPXL drag.
+#   Daily P&L on the position:
+#     option_value_change = shares_controlled × delta × dS
+#     theta_drag          = option_premium × theta_daily
+#
+#   We track: num_contracts × current_option_value per contract
+#   Option value per contract = intrinsic + extrinsic
+#   Simplified: option_value ≈ delta × S - K×e^{-rT} (BS approximation)
+#   But for daily tracking we use:
+#     V_t+1 = V_t × exp(delta × r_S) × (1 - theta_daily)
+#   where theta_daily = theta_mo / 21  (applied to option VALUE not notional)
+#
+#   The KEY difference from before:
+#   - Previous model: $500 → $500 position, theta eats it
+#   - CORRECT model:  $500 → controls $2500 notional, gains on $2500, theta on $500 premium
+#
+#   Effective annual return on capital in a 10% SPY year:
+#     gain = delta × 10% × (notional/premium) = 0.875 × 10% × 5 = 43.75% on capital
+#     theta cost = 0.5%/mo × 12 = 6% on premium (= 6% on capital invested)
+#     net ≈ 37-38% on capital in a normal bull year
 # =============================================================================
 
-def _bs_call_price(S, K, T, r, sigma):
-    try:
-        from scipy.stats import norm
-        if T <= 0 or sigma <= 0:
-            intrinsic = max(S - K, 0.01)
-            return intrinsic, min((S-K)/S + 0.05, 0.99), S / max(S-K, 0.01)
-        d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
-        d2 = d1 - sigma*np.sqrt(T)
-        price  = S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
-        delta  = float(norm.cdf(d1))
-        eff_lev= delta * S / max(price, 0.01)
-        return max(price, S-K+0.001), delta, eff_lev
-    except Exception:
-        intrinsic = max(S * 0.15, 0.01)
-        return intrinsic, 0.875, 0.875 * S / intrinsic
+def _option_leverage(delta, itm_pct=0.15):
+    """
+    Approximate capital leverage of a deep-ITM call.
+    Premium ≈ ITM% + small extrinsic ≈ itm_pct * 1.25 of underlying.
+    Returns: notional_per_dollar_invested = 1 / premium_as_pct_of_S
+    """
+    premium_pct = itm_pct * 1.25   # e.g. 15% ITM → premium ≈ 18.75% of S
+    return 1.0 / max(premium_pct, 0.05)
 
 
 def run_leaps_hybrid(
     years, monthly,
     ann_r, ann_s,
     voo_exp,
-    voo_core_pct   = 0.0,   # unused
-    leaps_pct      = 1.0,   # unused
-    trigger_dd     = 0.10,  # unused — always in LEAPS
+    voo_core_pct   = 0.0,
+    leaps_pct      = 1.0,
+    trigger_dd     = 0.10,
     delta_target   = 0.875,
     leaps_tenor    = 1.75,
     roll_months    = 9,
     roll_cost_pct  = 0.01,
-    theta_mo_pct   = 0.005,
-    risk_free      = 0.04,  # used only for BS pricing, not as yield
+    theta_mo_pct   = 0.005,   # theta as % of OPTION PREMIUM per month
+    risk_free      = 0.04,
     n_paths        = 200,
     seed           = 42,
     initial        = 0,
+    itm_pct        = 0.15,    # how far ITM: strike = S × (1 - itm_pct)
 ):
+    """
+    Each $1 invested buys 1/premium_pct of notional exposure.
+    Daily P&L = position_value × exp(delta × r_index) × (1 - theta_daily)
+    where position_value is the mark-to-market of the option, which starts
+    at premium (≈ itm_pct × 1.25 × S) and grows with the underlying.
+    """
     rng  = np.random.default_rng(seed)
     days = years * 252
     dt   = 1 / 252
+
+    # capital leverage: $1 of premium controls 1/premium_pct of notional
+    cap_lev = _option_leverage(delta_target, itm_pct)
 
     drift_idx  = (ann_r - 0.5*ann_s**2) * dt
     sig_idx    = ann_s * np.sqrt(dt)
@@ -580,36 +595,43 @@ def run_leaps_hybrid(
 
     Z = rng.standard_normal((days, n_paths))
 
-    for p in range(n_paths):
-        pos        = float(initial)   # 100% always in LEAPS position value
-        leaps_delta= delta_target
-        voo_b      = float(initial)
-        spxl_b     = float(initial)
+    theta_d = theta_mo_pct / 21.0
 
-        idx = 1.0
+    for p in range(n_paths):
+        # option portfolio value (mark-to-market)
+        # initial investment buys options at current premium
+        pos    = float(initial) * cap_lev  # notional controlled
+        # but we track option VALUE = notional × premium_pct initially,
+        # then it grows with delta × underlying
+        # Simpler: track option value directly.
+        # At purchase: option_value = cash_spent (that IS the premium)
+        # As underlying moves: option_value × exp(delta × r) × (1-theta)
+        # So pos starts = initial (the premium paid), gains at delta×r rate
+        pos    = float(initial)
+        voo_b  = float(initial)
+        spxl_b = float(initial)
 
         for i in range(days):
             r_idx  = drift_idx  + sig_idx  * Z[i, p]
             r_voo  = drift_voo  + sig_voo  * Z[i, p]
             r_spxl = drift_spxl + sig_spxl * Z[i, p]
 
-            # benchmarks
             voo_b  = max(voo_b  * np.exp(r_voo),  0.0)
             spxl_b = max(spxl_b * np.exp(r_spxl), 0.0)
 
-            # LEAPS: always on — delta-leveraged return minus daily theta
-            theta_d = theta_mo_pct / 21.0
-            pos = max(pos * np.exp(leaps_delta * r_idx) * (1.0 - theta_d), 0.0)
+            # LEAPS: option value grows at delta × index_return
+            # theta is % of option value per day (not notional)
+            # effective return on capital = delta × cap_lev × r_index - theta
+            eff_r  = delta_target * cap_lev * r_idx - theta_d
+            pos    = max(pos * np.exp(eff_r), 0.0)
 
-            idx *= np.exp(r_idx)
-
-            # ROLL every roll_months — just a cost, position stays open
+            # ROLL: small friction cost every roll_months
             if i > 0 and i % (roll_months * 21) == 0:
                 pos *= (1.0 - roll_cost_pct)
 
-            # MONTHLY DCA — add directly to position
+            # MONTHLY DCA: buy more options with this month's cash
             if i > 0 and i % 21 == 0:
-                pos    += monthly
+                pos    += monthly   # $monthly buys more option premium
                 voo_b  += monthly
                 spxl_b += monthly
 
@@ -625,7 +647,7 @@ def run_leaps_hybrid(
         "hybrid_p90":   np.percentile(all_leaps, 90, axis=1),
         "voo_p50":      np.percentile(all_voo,   50, axis=1),
         "spxl_p50":     np.percentile(all_spxl,  50, axis=1),
-        "leaps_active": np.ones(days+1),  # always 100% active
+        "leaps_active": np.ones(days+1),
     }
 
 
@@ -642,24 +664,21 @@ def run_leaps_historical(
     roll_cost_pct: float = 0.01,
     theta_mo_pct: float  = 0.005,
     risk_free: float     = 0.04,
+    itm_pct: float       = 0.15,
 ) -> pd.DataFrame:
-    """Always-on LEAPS backtest on real prices. 100% in deep-ITM calls at all times."""
+    """
+    Historical backtest: every $1 invested buys deep-ITM option premium.
+    Option value grows at delta × cap_leverage × index_return, minus theta.
+    """
     voo_prices   = prices["VOO"].values
     spxl_prices  = prices["SPXL"].values
     dates        = prices.index
     n            = len(dates)
 
-    log_rets_init = np.diff(np.log(np.maximum(voo_prices[:61], 1e-6)))
-    hist_vol = float(np.std(log_rets_init) * np.sqrt(252)) if len(log_rets_init) > 5 else 0.18
+    cap_lev = _option_leverage(delta_target, itm_pct)
+    theta_d = theta_mo_pct / 21.0
 
-    # price the initial contract
-    if n > 0 and voo_prices[0] > 0:
-        S0 = voo_prices[0]; K0 = S0 * 0.85
-        _, leaps_delta, _ = _bs_call_price(S0, K0, leaps_tenor, risk_free, hist_vol)
-    else:
-        leaps_delta = delta_target
-
-    pos  = float(initial)   # 100% in LEAPS, tracked as portfolio $ value
+    pos  = float(initial)
     lm   = -1
     invested = initial
     voo_shares_pure  = (initial / max(voo_prices[0], 1)) if initial > 0 else 0.0
@@ -677,21 +696,16 @@ def run_leaps_historical(
             out_invested[i] = invested
             continue
 
-        # daily P&L: delta * index log-return, minus theta
         if i > 0 and voo_prices[i-1] > 0:
-            r_idx   = np.log(vp / voo_prices[i-1])
-            theta_d = theta_mo_pct / 21.0
-            pos     = max(pos * np.exp(leaps_delta * r_idx) * (1.0 - theta_d), 0.0)
+            r_idx = np.log(vp / voo_prices[i-1])
+            eff_r = delta_target * cap_lev * r_idx - theta_d
+            pos   = max(pos * np.exp(eff_r), 0.0)
 
-        # ROLL every roll_months — re-price delta at current vol, apply cost
+        # ROLL
         if i > 0 and i % (roll_months * 21) == 0:
             pos *= (1.0 - roll_cost_pct)
-            try:
-                _, leaps_delta, _ = _bs_call_price(vp, vp*0.85, leaps_tenor, risk_free, hist_vol)
-            except Exception:
-                leaps_delta = delta_target
 
-        # MONTHLY DCA — straight into position
+        # MONTHLY DCA
         if date.month != lm:
             invested += monthly
             if vp > 0: voo_shares_pure  += monthly / vp
@@ -1256,6 +1270,8 @@ if not core_signal → switch to VOO
             st.markdown("##### Option parameters")
             delta_s  = st.slider("Target delta", 75, 95, 88, 1, key="l_delta",
                 help="0.85-0.90 = deep ITM. Higher delta = more intrinsic, less theta.") / 100
+            itm_s    = st.slider("How far ITM % (strike depth)", 10, 25, 15, 1, key="l_itm",
+                help="Strike = S × (1 - this%). 15% ITM = premium ≈ 18% of S = ~5.3x capital leverage.") / 100
             tenor_s  = st.slider("LEAPS tenor (years)", 1.0, 2.5, 1.75, 0.25, key="l_tenor",
                 help="Time to expiry on each contract. Roll before 6 months remain.")
 
@@ -1272,11 +1288,12 @@ if not core_signal → switch to VOO
             drag_ann    = vol_drag(3.0, ann_vol)
             # effective theta on notional: theta on premium, premium ≈ 15% of S
             eff_theta_notional = theta_s * 12 * 0.15
-            st.markdown("**Drag comparison:**")
-            st.caption(f"SPXL vol drag: **{drag_ann*100:.2f}%/yr** (always)")
-            st.caption(f"LEAPS theta on premium: **{theta_s*12*100:.1f}%/yr**")
-            st.caption(f"Theta on notional (~15% ITM): **{eff_theta_notional*100:.2f}%/yr**")
-            st.caption(f"LEAPS advantage: **+{(drag_ann - eff_theta_notional)*100:.1f}%/yr**")
+            cap_lev_d = 1.0 / max(itm_s * 1.25, 0.05)
+            st.markdown("**Capital efficiency:**")
+            st.caption(f"$1 premium controls ~${cap_lev_d:.1f} notional ({itm_s*100:.0f}% ITM)")
+            st.caption(f"10% SPY yr → ~{delta_s*cap_lev_d*10:.0f}% return on capital")
+            st.caption(f"Theta: {theta_s*12*100:.1f}%/yr on premium")
+            st.caption(f"Net base case: ~{delta_s*cap_lev_d*ann_ret*100 - theta_s*12*100:.0f}%/yr")
 
         with st.spinner(f"Running {leaps_paths} always-on LEAPS paths..."):
             lb = run_leaps_hybrid(
@@ -1288,6 +1305,7 @@ if not core_signal → switch to VOO
                 theta_mo_pct  = theta_s,
                 n_paths       = leaps_paths,
                 initial       = initial_inv,
+                itm_pct       = itm_s,
             )
 
         lp50  = float(lb["hybrid_p50"][-1])
@@ -1361,6 +1379,7 @@ if not core_signal → switch to VOO
                         roll_months   = roll_mo_s,
                         roll_cost_pct = roll_cost_s,
                         theta_mo_pct  = theta_s,
+                        itm_pct       = itm_s,
                     )
                     lh_final    = float(lh["Strategy"].iloc[-1])
                     voo_lh_fin  = float(lh["VOO_pure"].iloc[-1])
