@@ -963,7 +963,7 @@ def main():
 
         ctrl1, ctrl2, ctrl3 = st.columns(3)
         with ctrl1:
-            sb_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200, key="l_paths")
+            sb_paths  = st.select_slider("MC paths", options=[100, 200, 300, 500], value=200, key="sb_mc_paths")
             rebal_sp  = st.slider("Rebal speed %/month", 10, 60, 30, 10,
                 help="% of allocation gap closed each month.") / 100
         with ctrl2:
